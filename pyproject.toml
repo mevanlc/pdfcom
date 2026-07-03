@@ -1,0 +1,25 @@
+[project]
+name = "pdfcom"
+version = "0.1.0"
+description = "Try multiple PDF compression pipelines and keep the smallest valid result"
+readme = "README.md"
+authors = [
+    { name = "Mike Clark", email = "mevanlc@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "pikepdf>=10.9.1",
+    "pymupdf>=1.28.0",
+]
+
+[project.scripts]
+pdfcom = "pdfcom.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
