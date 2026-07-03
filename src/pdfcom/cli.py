@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 import multiprocessing
 import os
 from pathlib import Path
 import shutil
 import sys
 import tempfile
-from typing import Sequence
+from typing import Iterable, Sequence
 
-from .optimizer import OptimizationResult, optimize_pdf, plan_label
+from .optimizer import DEFAULT_PLAN_SPEC, Method, OptimizationResult, optimize_pdf, plan_label, select_plans
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,10 @@ class CliOptions:
     output_dir: Path | None
     clobber: bool
     workers: int
+    plan_spec: str
+    plans: tuple[tuple[Method, ...], ...]
+    unavailable_methods: tuple[Method, ...]
+    stats_file: Path | None
     inputs: tuple[Path, ...]
 
 
@@ -36,6 +41,7 @@ class ProcessReport:
     ok: bool
     stdout: tuple[str, ...] = ()
     stderr: tuple[str, ...] = ()
+    stats: dict[str, object] | None = None
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -50,6 +56,11 @@ def run(argv: Sequence[str] | None = None) -> int:
     if not namespace.dry_run and not namespace.inplace and namespace.output_dir is None:
         parser.error("one of -i or -o is required unless -n is used")
 
+    try:
+        plan_selection = select_plans(namespace.plan_spec)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     options = CliOptions(
         dry_run=namespace.dry_run,
         recurse=namespace.recurse,
@@ -57,6 +68,10 @@ def run(argv: Sequence[str] | None = None) -> int:
         output_dir=namespace.output_dir,
         clobber=clobber,
         workers=namespace.workers,
+        plan_spec=plan_selection.spec,
+        plans=plan_selection.plans,
+        unavailable_methods=plan_selection.unavailable_methods,
+        stats_file=namespace.stats_file,
         inputs=tuple(namespace.inputs),
     )
 
@@ -82,9 +97,15 @@ def run(argv: Sequence[str] | None = None) -> int:
             return 1
 
     had_error = bool(errors)
+    stats_records: list[dict[str, object]] = []
     for report in process_records(records, options):
         emit_report(report)
         had_error = had_error or not report.ok
+        if report.stats is not None:
+            stats_records.append(report.stats)
+
+    if options.stats_file is not None:
+        write_stats_file(options.stats_file, options, records, stats_records)
 
     return 1 if had_error else 0
 
@@ -95,7 +116,21 @@ def build_parser() -> argparse.ArgumentParser:
         description="Try multiple PDF compression pipelines and keep the smallest valid result.",
     )
     parser.add_argument("-n", dest="dry_run", action="store_true", help="dry run")
+    parser.add_argument(
+        "-p",
+        dest="plan_spec",
+        metavar="SPEC",
+        default=DEFAULT_PLAN_SPEC,
+        help=f"compression plan spec; default: {DEFAULT_PLAN_SPEC}",
+    )
     parser.add_argument("-r", dest="recurse", action="store_true", help="recurse into directories")
+    parser.add_argument(
+        "-s",
+        dest="stats_file",
+        metavar="FILE",
+        type=Path,
+        help="write per-plan optimization stats as JSON",
+    )
     parser.add_argument(
         "-w",
         dest="workers",
@@ -217,13 +252,15 @@ def output_collision_errors(records: list[InputPdf], output_dir: Path) -> list[s
     return errors
 
 
-def process_records(records: list[InputPdf], options: CliOptions) -> Sequence[ProcessReport]:
+def process_records(records: list[InputPdf], options: CliOptions) -> Iterable[ProcessReport]:
     if options.workers == 1 or len(records) <= 1:
-        return [process_one(record, options) for record in records]
+        for record in records:
+            yield process_one(record, options)
+        return
 
     context = multiprocessing.get_context("spawn")
     with context.Pool(processes=options.workers) as pool:
-        return list(pool.imap(process_one_job, ((record, options) for record in records)))
+        yield from pool.imap_unordered(process_one_job, ((record, options) for record in records))
 
 
 def process_one_job(job: tuple[InputPdf, CliOptions]) -> ProcessReport:
@@ -247,24 +284,38 @@ def process_one(record: InputPdf, options: CliOptions) -> ProcessReport:
         return ProcessReport(False, stderr=tuple(stderr))
 
     try:
-        with optimize_pdf(record.source) as result:
+        with optimize_pdf(
+            record.source,
+            plans=options.plans,
+            unavailable_methods=options.unavailable_methods,
+        ) as result:
             stdout.append(summary_line(record.display, result))
             if options.dry_run:
                 stdout.append(dry_run_action(record, options, result))
-                return ProcessReport(True, stdout=tuple(stdout))
+                return ProcessReport(True, stdout=tuple(stdout), stats=optional_stats(record, result, options))
             if options.inplace:
                 ok, message = write_inplace(record, result)
                 stdout.append(message)
-                return ProcessReport(ok, stdout=tuple(stdout))
+                return ProcessReport(ok, stdout=tuple(stdout), stats=optional_stats(record, result, options))
             if target is None:
                 stderr.append(f"{record.display}: no output mode selected")
-                return ProcessReport(False, stdout=tuple(stdout), stderr=tuple(stderr))
+                return ProcessReport(
+                    False,
+                    stdout=tuple(stdout),
+                    stderr=tuple(stderr),
+                    stats=optional_stats(record, result, options),
+                )
             ok, message, error = write_to_output(record, result, target, options.clobber)
             if message is not None:
                 stdout.append(message)
             if error is not None:
                 stderr.append(error)
-            return ProcessReport(ok, stdout=tuple(stdout), stderr=tuple(stderr))
+            return ProcessReport(
+                ok,
+                stdout=tuple(stdout),
+                stderr=tuple(stderr),
+                stats=optional_stats(record, result, options),
+            )
     except Exception as exc:  # noqa: BLE001 - report file-level failure and continue.
         stderr.append(f"{record.display}: error: {exc}")
         return ProcessReport(False, stdout=tuple(stdout), stderr=tuple(stderr))
@@ -277,6 +328,81 @@ def summary_line(display: str, result: OptimizationResult) -> str:
         f"{display}: {format_bytes(result.original_size)} -> {format_bytes(result.best.size)}; "
         f"save {format_bytes(saved)} ({max(result.saved_percent, 0):.2f}%) via {plan}"
     )
+
+
+def stats_record(record: InputPdf, result: OptimizationResult) -> dict[str, object]:
+    return {
+        "source": record.source.as_posix(),
+        "display": record.display,
+        "output_rel": record.output_rel.as_posix(),
+        "original_size": result.original_size,
+        "original_page_count": result.original_page_count,
+        "best_plan": plan_label(result.best.plan),
+        "best_methods": [method.value for method in result.best.plan],
+        "best_size": result.best.size,
+        "saved_bytes": result.saved_bytes,
+        "saved_percent": result.saved_percent,
+        "reduced": result.reduced,
+        "attempted_plans": result.attempted_plans,
+        "unavailable_methods": [method.value for method in result.unavailable_methods],
+        "plans": [
+            {
+                "plan": plan_label(plan_result.plan),
+                "methods": [method.value for method in plan_result.plan],
+                "ok": plan_result.ok,
+                "size": plan_result.size,
+                "page_count": plan_result.page_count,
+                "saved_bytes": (
+                    result.original_size - plan_result.size if plan_result.size is not None else None
+                ),
+                "saved_percent": (
+                    (result.original_size - plan_result.size) / result.original_size * 100
+                    if plan_result.size is not None and result.original_size
+                    else None
+                ),
+                "error": plan_result.error,
+            }
+            for plan_result in result.plan_results
+        ],
+        "failed_plans": result.failed_plans,
+    }
+
+
+def optional_stats(
+    record: InputPdf,
+    result: OptimizationResult,
+    options: CliOptions,
+) -> dict[str, object] | None:
+    if options.stats_file is None:
+        return None
+    return stats_record(record, result)
+
+
+def write_stats_file(
+    path: Path,
+    options: CliOptions,
+    records: list[InputPdf],
+    stats_records: list[dict[str, object]],
+) -> None:
+    payload = {
+        "version": 1,
+        "options": {
+            "dry_run": options.dry_run,
+            "recurse": options.recurse,
+            "inplace": options.inplace,
+            "output_dir": options.output_dir.as_posix() if options.output_dir is not None else None,
+            "clobber": options.clobber,
+            "workers": options.workers,
+            "plan_spec": options.plan_spec,
+            "plans": [[method.value for method in plan] for plan in options.plans],
+            "unavailable_methods": [method.value for method in options.unavailable_methods],
+            "inputs": [path.as_posix() for path in options.inputs],
+        },
+        "input_count": len(records),
+        "results": sorted(stats_records, key=lambda item: str(item["display"])),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def dry_run_action(record: InputPdf, options: CliOptions, result: OptimizationResult) -> str:

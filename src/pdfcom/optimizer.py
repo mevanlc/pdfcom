@@ -3,12 +3,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-from itertools import permutations
+from itertools import combinations, permutations, product
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from typing import Iterator
+from typing import Iterable, Iterator
+import warnings
 
 import pikepdf
 import pymupdf
@@ -18,13 +19,23 @@ class Method(StrEnum):
     GHOSTSCRIPT = "ghostscript"
     PIKEPDF = "pikepdf"
     PYMUPDF = "pymupdf"
+    QPDF = "qpdf"
 
 
 ALL_METHODS: tuple[Method, ...] = (
     Method.GHOSTSCRIPT,
     Method.PIKEPDF,
     Method.PYMUPDF,
+    Method.QPDF,
 )
+
+DEFAULT_PLAN_SPEC = "gs?,{mu?,pike?},q"
+METHOD_NAMES = {
+    "gs": Method.GHOSTSCRIPT,
+    "pike": Method.PIKEPDF,
+    "mu": Method.PYMUPDF,
+    "q": Method.QPDF,
+}
 
 
 @dataclass(frozen=True)
@@ -32,6 +43,22 @@ class Candidate:
     plan: tuple[Method, ...]
     path: Path
     size: int
+
+
+@dataclass(frozen=True)
+class PlanResult:
+    plan: tuple[Method, ...]
+    ok: bool
+    size: int | None = None
+    page_count: int | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class PlanSelection:
+    spec: str
+    plans: tuple[tuple[Method, ...], ...]
+    unavailable_methods: tuple[Method, ...]
 
 
 @dataclass(frozen=True)
@@ -43,6 +70,7 @@ class OptimizationResult:
     attempted_plans: int
     failed_plans: dict[str, str]
     unavailable_methods: tuple[Method, ...]
+    plan_results: tuple[PlanResult, ...]
 
     @property
     def reduced(self) -> bool:
@@ -65,15 +93,25 @@ def plan_label(plan: tuple[Method, ...]) -> str:
     return "+".join(method.value for method in plan)
 
 
-def available_methods() -> tuple[tuple[Method, ...], tuple[Method, ...]]:
+def select_plans(spec: str = DEFAULT_PLAN_SPEC) -> PlanSelection:
+    requested_plans = expand_plan_spec(spec)
+    requested_methods = tuple(dict.fromkeys(method for plan in requested_plans for method in plan))
+    unavailable = unavailable_methods(requested_methods)
+    plans = dedupe_plans(
+        tuple(method for method in plan if method not in unavailable)
+        for plan in requested_plans
+    )
+    return PlanSelection(spec=spec, plans=plans, unavailable_methods=unavailable)
+
+
+def unavailable_methods(methods: tuple[Method, ...]) -> tuple[Method, ...]:
     unavailable = []
-    methods = []
-    for method in ALL_METHODS:
+    for method in methods:
         if method is Method.GHOSTSCRIPT and shutil.which("gs") is None:
             unavailable.append(method)
-        else:
-            methods.append(method)
-    return tuple(methods), tuple(unavailable)
+        elif method is Method.QPDF and shutil.which("qpdf") is None:
+            unavailable.append(method)
+    return tuple(unavailable)
 
 
 def optimization_plans(methods: tuple[Method, ...]) -> list[tuple[Method, ...]]:
@@ -83,23 +121,181 @@ def optimization_plans(methods: tuple[Method, ...]) -> list[tuple[Method, ...]]:
     return plans
 
 
+def expand_plan_spec(spec: str) -> tuple[tuple[Method, ...], ...]:
+    terms = split_top_level(spec)
+    if not terms:
+        raise ValueError("empty plan spec")
+
+    term_choices = [expand_plan_term(term) for term in terms]
+    plans = []
+    for choices in product(*term_choices):
+        plan = tuple(method for choice in choices for method in choice)
+        plans.append(plan)
+    return dedupe_plans(plans)
+
+
+def expand_plan_term(term: str) -> tuple[tuple[Method, ...], ...]:
+    term = term.strip()
+    if not term:
+        raise ValueError("empty plan term")
+
+    group_optional = term.endswith("?")
+    group = term[:-1].strip() if group_optional else term
+    if group.startswith("{") or group.startswith("("):
+        opener = group[0]
+        closer = "}" if opener == "{" else ")"
+        if not group.endswith(closer):
+            raise ValueError(f"unterminated plan group: {term}")
+        inner = group[1:-1]
+        items = parse_plan_items(inner)
+        choices = expand_plan_items(items, permute=opener == "{")
+        if group_optional:
+            choices = (*choices, ())
+        return dedupe_plan_choices(choices)
+
+    if term.startswith("}") or term.startswith(")") or term.startswith("{") or term.startswith("("):
+        raise ValueError(f"invalid plan term: {term}")
+
+    method, optional = parse_plan_item(term)
+    choices: tuple[tuple[Method, ...], ...] = ((method,),)
+    if optional:
+        choices = (*choices, ())
+    return choices
+
+
+def parse_plan_items(inner: str) -> tuple[tuple[Method, bool], ...]:
+    terms = split_top_level(inner)
+    if not terms:
+        raise ValueError("empty plan group")
+    items = tuple(parse_plan_item(term) for term in terms)
+    methods = [method for method, _optional in items]
+    if len(set(methods)) != len(methods):
+        raise ValueError("duplicate method in plan group")
+    return items
+
+
+def parse_plan_item(item: str) -> tuple[Method, bool]:
+    item = item.strip()
+    optional = item.endswith("?")
+    name = item[:-1].strip() if optional else item
+    if not name:
+        raise ValueError("empty method name in plan spec")
+    try:
+        return METHOD_NAMES[name], optional
+    except KeyError as exc:
+        raise ValueError(f"unknown method in plan spec: {name}") from exc
+
+
+def expand_plan_items(
+    items: tuple[tuple[Method, bool], ...],
+    *,
+    permute: bool,
+) -> tuple[tuple[Method, ...], ...]:
+    optional_methods = [method for method, optional in items if optional]
+    choices = []
+    for included_optional in optional_subsets(optional_methods):
+        selected = tuple(
+            method
+            for method, optional in items
+            if not optional or method in included_optional
+        )
+        if not selected:
+            choices.append(())
+        elif permute:
+            choices.extend(permutations(selected))
+        else:
+            choices.append(selected)
+    return dedupe_plan_choices(choices)
+
+
+def optional_subsets(methods: list[Method]) -> tuple[frozenset[Method], ...]:
+    subsets = []
+    count = len(methods)
+    for length in range(count, -1, -1):
+        subsets.extend(frozenset(subset) for subset in combinations(methods, length))
+    return tuple(subsets)
+
+
+def split_top_level(value: str) -> list[str]:
+    terms = []
+    start = 0
+    depth = 0
+    for index, char in enumerate(value):
+        if char in "{(":
+            depth += 1
+        elif char in "})":
+            depth -= 1
+            if depth < 0:
+                raise ValueError(f"unmatched closing delimiter in plan spec: {value}")
+        elif char == "," and depth == 0:
+            terms.append(value[start:index].strip())
+            start = index + 1
+    if depth != 0:
+        raise ValueError(f"unmatched opening delimiter in plan spec: {value}")
+    final = value[start:].strip()
+    if final:
+        terms.append(final)
+    elif value.strip().endswith(","):
+        raise ValueError("plan spec cannot end with a comma")
+    return terms
+
+
+def dedupe_plan_choices(plans: Iterable[tuple[Method, ...]]) -> tuple[tuple[Method, ...], ...]:
+    deduped = []
+    seen = set()
+    for plan in plans:
+        if plan in seen:
+            continue
+        seen.add(plan)
+        deduped.append(plan)
+    return tuple(deduped)
+
+
+def dedupe_plans(plans: Iterable[tuple[Method, ...]]) -> tuple[tuple[Method, ...], ...]:
+    return tuple(plan for plan in dedupe_plan_choices(plans) if plan)
+
+
 @contextmanager
-def optimize_pdf(source: Path) -> Iterator[OptimizationResult]:
+def optimize_pdf(
+    source: Path,
+    *,
+    plans: tuple[tuple[Method, ...], ...] | None = None,
+    unavailable_methods: tuple[Method, ...] = (),
+) -> Iterator[OptimizationResult]:
     with tempfile.TemporaryDirectory(prefix="pdfcom-") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
-        yield _optimize_pdf(source, temp_dir)
+        if plans is None:
+            selection = select_plans()
+            plans = selection.plans
+            unavailable_methods = selection.unavailable_methods
+        yield _optimize_pdf(
+            source,
+            temp_dir,
+            plans=plans,
+            unavailable_methods=unavailable_methods,
+        )
 
 
-def _optimize_pdf(source: Path, temp_dir: Path) -> OptimizationResult:
+def _optimize_pdf(
+    source: Path,
+    temp_dir: Path,
+    *,
+    plans: tuple[tuple[Method, ...], ...] | None = None,
+    unavailable_methods: tuple[Method, ...] = (),
+) -> OptimizationResult:
     source = source.resolve()
     original_size = source.stat().st_size
     original_page_count = page_count(source)
     best = Candidate((), source, original_size)
-    methods, unavailable = available_methods()
+    if plans is None:
+        selection = select_plans()
+        plans = selection.plans
+        unavailable_methods = selection.unavailable_methods
     failures: dict[str, str] = {}
+    plan_results: list[PlanResult] = []
     attempted = 0
 
-    for plan_index, plan in enumerate(optimization_plans(methods), start=1):
+    for plan_index, plan in enumerate(plans, start=1):
         attempted += 1
         current = source
         try:
@@ -117,10 +313,19 @@ def _optimize_pdf(source: Path, temp_dir: Path) -> OptimizationResult:
                     "page count changed "
                     f"from {original_page_count} to {candidate_page_count}"
                 )
+            plan_results.append(
+                PlanResult(
+                    plan=plan,
+                    ok=True,
+                    size=candidate_size,
+                    page_count=candidate_page_count,
+                )
+            )
             if candidate_size < best.size:
                 best = Candidate(plan, current, candidate_size)
         except Exception as exc:  # noqa: BLE001 - keep trying other compressors.
             failures[plan_label(plan)] = str(exc)
+            plan_results.append(PlanResult(plan=plan, ok=False, error=str(exc)))
 
     return OptimizationResult(
         source=source,
@@ -129,7 +334,8 @@ def _optimize_pdf(source: Path, temp_dir: Path) -> OptimizationResult:
         best=best,
         attempted_plans=attempted,
         failed_plans=failures,
-        unavailable_methods=unavailable,
+        unavailable_methods=unavailable_methods,
+        plan_results=tuple(plan_results),
     )
 
 
@@ -149,6 +355,8 @@ def run_method(method: Method, source: Path, output: Path) -> None:
         run_pikepdf(source, output)
     elif method is Method.PYMUPDF:
         run_pymupdf(source, output)
+    elif method is Method.QPDF:
+        run_qpdf(source, output)
     else:
         raise ValueError(f"unknown optimizer method: {method}")
 
@@ -193,14 +401,16 @@ def run_ghostscript(source: Path, output: Path) -> None:
 
 def run_pikepdf(source: Path, output: Path) -> None:
     with pikepdf.Pdf.open(source) as pdf:
-        pdf.save(
-            output,
-            compress_streams=True,
-            recompress_flate=True,
-            object_stream_mode=pikepdf.ObjectStreamMode.generate,
-            linearize=False,
-            deterministic_id=True,
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", category=pikepdf.PageCopyWarning)
+            pdf.save(
+                output,
+                compress_streams=True,
+                recompress_flate=True,
+                object_stream_mode=pikepdf.ObjectStreamMode.generate,
+                linearize=False,
+                deterministic_id=True,
+            )
 
 
 def run_pymupdf(source: Path, output: Path) -> None:
@@ -208,3 +418,33 @@ def run_pymupdf(source: Path, output: Path) -> None:
         if document.needs_pass:
             raise RuntimeError("encrypted PDF requires a password")
         document.save(output, garbage=4, deflate=True)
+
+
+def run_qpdf(source: Path, output: Path) -> None:
+    qpdf = shutil.which("qpdf")
+    if qpdf is None:
+        raise RuntimeError("qpdf executable not found: qpdf")
+
+    command = [
+        qpdf,
+        "--compress-streams=y",
+        "--decode-level=generalized",
+        "--recompress-flate",
+        "--compression-level=9",
+        "--object-streams=generate",
+        "--deterministic-id",
+        str(source),
+        str(output),
+    ]
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        if len(stderr) > 500:
+            stderr = stderr[-500:]
+        raise RuntimeError(f"qpdf failed with exit {completed.returncode}: {stderr}")

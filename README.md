@@ -12,7 +12,9 @@ pdfcom [options] <pdf_file_or_dir> [pdf_file_or_dir...]
 
 ```text
 -n          dry run
+-p <spec>   use a compression plan spec
 -r          recurse into input directories
+-s <file>   write per-plan optimization stats as JSON
 -w <n>      use n worker processes
 -i          replace reduced PDFs in place
 -o <dir>    write outputs to <dir>
@@ -41,16 +43,55 @@ pdfcom -o compressed foo.pdf
 
 ## Compression Methods
 
-For each PDF, `pdfcom` tries every non-empty permutation of the available
-methods:
+For each PDF, `pdfcom` tries the selected compression plans and keeps the
+smallest valid result.
 
 - Ghostscript as a subprocess, when `gs` is on `PATH`
 - `pikepdf` as a library
 - PyMuPDF as a library using the equivalent of `-ggggz`
+- `qpdf` as a subprocess, when `qpdf` is on `PATH`
 
 Files that cannot be made smaller are copied unchanged in `-o` mode and left
 alone in `-i` mode.
 
 Use `-w` to process multiple input PDFs in parallel. The pool uses Python's
 spawn multiprocessing context, so each worker process runs an independent PDF
-compression pipeline.
+compression pipeline. Results are printed as workers complete.
+
+The default plan spec is:
+
+```text
+gs?,{mu?,pike?},q
+```
+
+That tries Ghostscript in the first position or omits it, tries all
+permutations of PyMuPDF and pikepdf in the middle including either one or
+neither, and applies qpdf last. If `gs` or `qpdf` is not available on `PATH`,
+that method is omitted from the generated plans. The qpdf stage recompresses
+Flate streams with compression level 9 and generates object streams, but does
+not enable lossy image optimization.
+
+Plan specs use these method names:
+
+```text
+gs    Ghostscript
+mu    PyMuPDF
+pike  pikepdf
+q     qpdf
+```
+
+Use commas for fixed order, braces for permutations, parentheses for fixed-order
+combinations, and `?` to make the preceding item or group optional:
+
+```text
+gs,q              # gs then q
+gs,q?             # gs+q and gs
+{mu,pike}         # mu+pike and pike+mu
+(mu,pike)         # mu+pike only
+{mu?,pike?}       # both orders, either single method, or neither
+gs?,{mu?,pike?},q # default
+```
+
+Use `-s` to write a JSON stats file with one result per input PDF. Each result
+includes the winning plan, unavailable methods, failed plans, and per-plan
+sizes so method order and marginal savings can be analyzed after a run.
