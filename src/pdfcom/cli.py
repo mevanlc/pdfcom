@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import multiprocessing
 import os
 from pathlib import Path
 import shutil
@@ -26,7 +27,15 @@ class CliOptions:
     inplace: bool
     output_dir: Path | None
     clobber: bool
+    workers: int
     inputs: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class ProcessReport:
+    ok: bool
+    stdout: tuple[str, ...] = ()
+    stderr: tuple[str, ...] = ()
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -47,6 +56,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         inplace=namespace.inplace,
         output_dir=namespace.output_dir,
         clobber=clobber,
+        workers=namespace.workers,
         inputs=tuple(namespace.inputs),
     )
 
@@ -72,9 +82,9 @@ def run(argv: Sequence[str] | None = None) -> int:
             return 1
 
     had_error = bool(errors)
-    for record in records:
-        ok = process_one(record, options)
-        had_error = had_error or not ok
+    for report in process_records(records, options):
+        emit_report(report)
+        had_error = had_error or not report.ok
 
     return 1 if had_error else 0
 
@@ -86,6 +96,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-n", dest="dry_run", action="store_true", help="dry run")
     parser.add_argument("-r", dest="recurse", action="store_true", help="recurse into directories")
+    parser.add_argument(
+        "-w",
+        dest="workers",
+        metavar="N",
+        type=positive_int,
+        default=1,
+        help="number of worker processes",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("-i", dest="inplace", action="store_true", help="replace reducible PDFs in place")
     mode.add_argument("-o", dest="output_dir", metavar="DIR", type=Path, help="write outputs to DIR")
@@ -98,6 +116,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("inputs", metavar="pdf_file_or_dir", nargs="+", type=Path)
     return parser
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def discover_inputs(inputs: tuple[Path, ...], recurse: bool) -> tuple[list[InputPdf], list[str]]:
@@ -189,27 +217,57 @@ def output_collision_errors(records: list[InputPdf], output_dir: Path) -> list[s
     return errors
 
 
-def process_one(record: InputPdf, options: CliOptions) -> bool:
+def process_records(records: list[InputPdf], options: CliOptions) -> Sequence[ProcessReport]:
+    if options.workers == 1 or len(records) <= 1:
+        return [process_one(record, options) for record in records]
+
+    context = multiprocessing.get_context("spawn")
+    with context.Pool(processes=options.workers) as pool:
+        return list(pool.imap(process_one_job, ((record, options) for record in records)))
+
+
+def process_one_job(job: tuple[InputPdf, CliOptions]) -> ProcessReport:
+    record, options = job
+    return process_one(record, options)
+
+
+def emit_report(report: ProcessReport) -> None:
+    for line in report.stdout:
+        print(line)
+    for line in report.stderr:
+        print(line, file=sys.stderr)
+
+
+def process_one(record: InputPdf, options: CliOptions) -> ProcessReport:
+    stdout: list[str] = []
+    stderr: list[str] = []
     target = options.output_dir / record.output_rel if options.output_dir is not None else None
     if target is not None and target.exists() and not options.clobber and not options.dry_run:
-        print(f"{record.display}: skip; output exists: {target}", file=sys.stderr)
-        return False
+        stderr.append(f"{record.display}: skip; output exists: {target}")
+        return ProcessReport(False, stderr=tuple(stderr))
 
     try:
         with optimize_pdf(record.source) as result:
-            print(summary_line(record.display, result))
+            stdout.append(summary_line(record.display, result))
             if options.dry_run:
-                print(dry_run_action(record, options, result))
-                return True
+                stdout.append(dry_run_action(record, options, result))
+                return ProcessReport(True, stdout=tuple(stdout))
             if options.inplace:
-                return write_inplace(record, result)
+                ok, message = write_inplace(record, result)
+                stdout.append(message)
+                return ProcessReport(ok, stdout=tuple(stdout))
             if target is None:
-                print(f"{record.display}: no output mode selected", file=sys.stderr)
-                return False
-            return write_to_output(record, result, target, options.clobber)
+                stderr.append(f"{record.display}: no output mode selected")
+                return ProcessReport(False, stdout=tuple(stdout), stderr=tuple(stderr))
+            ok, message, error = write_to_output(record, result, target, options.clobber)
+            if message is not None:
+                stdout.append(message)
+            if error is not None:
+                stderr.append(error)
+            return ProcessReport(ok, stdout=tuple(stdout), stderr=tuple(stderr))
     except Exception as exc:  # noqa: BLE001 - report file-level failure and continue.
-        print(f"{record.display}: error: {exc}", file=sys.stderr)
-        return False
+        stderr.append(f"{record.display}: error: {exc}")
+        return ProcessReport(False, stdout=tuple(stdout), stderr=tuple(stderr))
 
 
 def summary_line(display: str, result: OptimizationResult) -> str:
@@ -238,13 +296,11 @@ def dry_run_action(record: InputPdf, options: CliOptions, result: OptimizationRe
     return f"{record.display}: dry run only; no output mode selected"
 
 
-def write_inplace(record: InputPdf, result: OptimizationResult) -> bool:
+def write_inplace(record: InputPdf, result: OptimizationResult) -> tuple[bool, str]:
     if not result.reduced:
-        print(f"{record.display}: left unchanged")
-        return True
+        return True, f"{record.display}: left unchanged"
     atomic_copy(result.best.path, record.source, mode_source=record.source, preserve_metadata=False)
-    print(f"{record.display}: replaced in place")
-    return True
+    return True, f"{record.display}: replaced in place"
 
 
 def write_to_output(
@@ -252,17 +308,15 @@ def write_to_output(
     result: OptimizationResult,
     target: Path,
     clobber: bool,
-) -> bool:
+) -> tuple[bool, str | None, str | None]:
     if target.exists() and not clobber:
-        print(f"{record.display}: skip; output exists: {target}", file=sys.stderr)
-        return False
+        return False, None, f"{record.display}: skip; output exists: {target}"
 
     content_source = result.best.path if result.reduced else record.source
     preserve_metadata = not result.reduced
     atomic_copy(content_source, target, mode_source=record.source, preserve_metadata=preserve_metadata)
     action = "wrote optimized output" if result.reduced else "copied original output"
-    print(f"{record.display}: {action}: {target}")
-    return True
+    return True, f"{record.display}: {action}: {target}", None
 
 
 def atomic_copy(

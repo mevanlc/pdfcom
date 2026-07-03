@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pdfcom.cli import discover_inputs, output_collision_errors
+import pytest
+
+from pdfcom.cli import build_parser, discover_inputs, output_collision_errors
 from pdfcom.optimizer import Method, optimization_plans, plan_label
 
 
@@ -67,3 +69,14 @@ def test_optimizer_plans_try_all_non_empty_permutations() -> None:
 
     assert len(plans) == 15
     assert plan_label((Method.GHOSTSCRIPT, Method.PIKEPDF)) == "ghostscript+pikepdf"
+
+
+def test_parser_accepts_worker_count() -> None:
+    namespace = build_parser().parse_args(["-w", "3", "-n", "one.pdf"])
+
+    assert namespace.workers == 3
+
+
+def test_parser_rejects_zero_workers() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["-w", "0", "-n", "one.pdf"])

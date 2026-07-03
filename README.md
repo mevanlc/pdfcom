@@ -13,6 +13,7 @@ pdfcom [options] <pdf_file_or_dir> [pdf_file_or_dir...]
 ```text
 -n          dry run
 -r          recurse into input directories
+-w <n>      use n worker processes
 -i          replace reduced PDFs in place
 -o <dir>    write outputs to <dir>
 -c          clobber existing output files
@@ -49,3 +50,7 @@ methods:
 
 Files that cannot be made smaller are copied unchanged in `-o` mode and left
 alone in `-i` mode.
+
+Use `-w` to process multiple input PDFs in parallel. The pool uses Python's
+spawn multiprocessing context, so each worker process runs an independent PDF
+compression pipeline.
