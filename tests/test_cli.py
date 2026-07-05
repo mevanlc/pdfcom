@@ -21,6 +21,7 @@ from pdfcom.cli import (
 from pdfcom.optimizer import (
     Candidate,
     DEFAULT_PLAN_SPEC,
+    FULL_PERMUTATION_PLAN_SPEC,
     Method,
     OptimizationResult,
     PlanResult,
@@ -30,6 +31,7 @@ from pdfcom.optimizer import (
     plan_label,
     run_pikepdf,
     run_qpdf,
+    select_full_permutation_plans,
     select_plans,
 )
 
@@ -126,6 +128,20 @@ def test_default_plan_spec_uses_qpdf_last_shape(monkeypatch: pytest.MonkeyPatch)
     )
 
 
+def test_full_permutation_selection_tries_all_lengths(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("pdfcom.optimizer.shutil.which", lambda command: f"/usr/bin/{command}")
+
+    selection = select_full_permutation_plans()
+
+    assert selection.spec == FULL_PERMUTATION_PLAN_SPEC
+    assert selection.unavailable_methods == ()
+    assert selection.plans == tuple(
+        optimization_plans((Method.GHOSTSCRIPT, Method.PIKEPDF, Method.PYMUPDF, Method.QPDF))
+    )
+    assert (Method.QPDF,) in selection.plans
+    assert (Method.GHOSTSCRIPT, Method.QPDF, Method.PYMUPDF, Method.PIKEPDF) in selection.plans
+
+
 def test_plan_selection_drops_unavailable_executables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -171,6 +187,17 @@ def test_parser_accepts_plan_spec() -> None:
     namespace = build_parser().parse_args(["-p", "q", "-n", "one.pdf"])
 
     assert namespace.plan_spec == "q"
+
+
+def test_parser_accepts_full_permutation_shortcut() -> None:
+    namespace = build_parser().parse_args(["-P", "-n", "one.pdf"])
+
+    assert namespace.full_permutation is True
+
+
+def test_parser_rejects_plan_spec_with_full_permutation_shortcut() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["-P", "-p", "q", "-n", "one.pdf"])
 
 
 def test_parser_accepts_stats_file() -> None:

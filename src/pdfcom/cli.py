@@ -11,7 +11,15 @@ import sys
 import tempfile
 from typing import Iterable, Sequence
 
-from .optimizer import DEFAULT_PLAN_SPEC, Method, OptimizationResult, optimize_pdf, plan_label, select_plans
+from .optimizer import (
+    DEFAULT_PLAN_SPEC,
+    Method,
+    OptimizationResult,
+    optimize_pdf,
+    plan_label,
+    select_full_permutation_plans,
+    select_plans,
+)
 
 
 @dataclass(frozen=True)
@@ -57,7 +65,10 @@ def run(argv: Sequence[str] | None = None) -> int:
         parser.error("one of -i or -o is required unless -n is used")
 
     try:
-        plan_selection = select_plans(namespace.plan_spec)
+        if namespace.full_permutation:
+            plan_selection = select_full_permutation_plans()
+        else:
+            plan_selection = select_plans(namespace.plan_spec)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -116,12 +127,19 @@ def build_parser() -> argparse.ArgumentParser:
         description="Try multiple PDF compression pipelines and keep the smallest valid result.",
     )
     parser.add_argument("-n", dest="dry_run", action="store_true", help="dry run")
-    parser.add_argument(
+    plan_mode = parser.add_mutually_exclusive_group()
+    plan_mode.add_argument(
         "-p",
         dest="plan_spec",
         metavar="SPEC",
         default=DEFAULT_PLAN_SPEC,
         help=f"compression plan spec; default: {DEFAULT_PLAN_SPEC}",
+    )
+    plan_mode.add_argument(
+        "-P",
+        dest="full_permutation",
+        action="store_true",
+        help="try all non-empty permutations of all compression methods",
     )
     parser.add_argument("-r", dest="recurse", action="store_true", help="recurse into directories")
     parser.add_argument(

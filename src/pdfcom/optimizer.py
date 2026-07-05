@@ -30,6 +30,7 @@ ALL_METHODS: tuple[Method, ...] = (
 )
 
 DEFAULT_PLAN_SPEC = "gs?,{mu?,pike?},q"
+FULL_PERMUTATION_PLAN_SPEC = "{gs?,pike?,mu?,q?}"
 METHOD_NAMES = {
     "gs": Method.GHOSTSCRIPT,
     "pike": Method.PIKEPDF,
@@ -102,6 +103,19 @@ def select_plans(spec: str = DEFAULT_PLAN_SPEC) -> PlanSelection:
         for plan in requested_plans
     )
     return PlanSelection(spec=spec, plans=plans, unavailable_methods=unavailable)
+
+
+def select_full_permutation_plans() -> PlanSelection:
+    unavailable = unavailable_methods(ALL_METHODS)
+    plans = dedupe_plans(
+        tuple(method for method in plan if method not in unavailable)
+        for plan in optimization_plans(ALL_METHODS)
+    )
+    return PlanSelection(
+        spec=FULL_PERMUTATION_PLAN_SPEC,
+        plans=plans,
+        unavailable_methods=unavailable,
+    )
 
 
 def unavailable_methods(methods: tuple[Method, ...]) -> tuple[Method, ...]:

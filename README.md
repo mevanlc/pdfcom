@@ -13,6 +13,7 @@ pdfcom [options] <pdf_file_or_dir> [pdf_file_or_dir...]
 ```text
 -n          dry run
 -p <spec>   use a compression plan spec
+-P          try all non-empty permutations of all methods
 -r          recurse into input directories
 -s <file>   write per-plan optimization stats as JSON
 -w <n>      use n worker processes
@@ -90,6 +91,12 @@ gs,q?             # gs+q and gs
 (mu,pike)         # mu+pike only
 {mu?,pike?}       # both orders, either single method, or neither
 gs?,{mu?,pike?},q # default
+```
+
+Use `-P` as a shortcut for the full permutation plan:
+
+```text
+{gs?,pike?,mu?,q?}
 ```
 
 Use `-s` to write a JSON stats file with one result per input PDF. Each result
