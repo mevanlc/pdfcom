@@ -16,9 +16,12 @@ from .optimizer import (
     Method,
     OptimizationResult,
     optimize_pdf,
+    parse_verification_spec,
     plan_label,
     select_full_permutation_plans,
     select_plans,
+    VerificationCheck,
+    VerificationResult,
 )
 
 
@@ -40,6 +43,8 @@ class CliOptions:
     plan_spec: str
     plans: tuple[tuple[Method, ...], ...]
     unavailable_methods: tuple[Method, ...]
+    test_spec: str | None
+    verification_checks: tuple[VerificationCheck, ...]
     stats_file: Path | None
     inputs: tuple[Path, ...]
 
@@ -69,6 +74,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             plan_selection = select_full_permutation_plans()
         else:
             plan_selection = select_plans(namespace.plan_spec)
+        verification_checks = parse_verification_spec(namespace.test_spec)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -82,6 +88,8 @@ def run(argv: Sequence[str] | None = None) -> int:
         plan_spec=plan_selection.spec,
         plans=plan_selection.plans,
         unavailable_methods=plan_selection.unavailable_methods,
+        test_spec=namespace.test_spec,
+        verification_checks=verification_checks,
         stats_file=namespace.stats_file,
         inputs=tuple(namespace.inputs),
     )
@@ -142,6 +150,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="try all non-empty permutations of all compression methods",
     )
     parser.add_argument("-r", dest="recurse", action="store_true", help="recurse into directories")
+    parser.add_argument(
+        "-t",
+        dest="test_spec",
+        metavar="SPEC",
+        help="post-compression verification test spec",
+    )
     parser.add_argument(
         "-s",
         dest="stats_file",
@@ -306,15 +320,27 @@ def process_one(record: InputPdf, options: CliOptions) -> ProcessReport:
             record.source,
             plans=options.plans,
             unavailable_methods=options.unavailable_methods,
+            verification_checks=options.verification_checks,
         ) as result:
             stdout.append(summary_line(record.display, result))
+            stderr.extend(result_warnings(record.display, result))
             if options.dry_run:
                 stdout.append(dry_run_action(record, options, result))
-                return ProcessReport(True, stdout=tuple(stdout), stats=optional_stats(record, result, options))
+                return ProcessReport(
+                    True,
+                    stdout=tuple(stdout),
+                    stderr=tuple(stderr),
+                    stats=optional_stats(record, result, options),
+                )
             if options.inplace:
                 ok, message = write_inplace(record, result)
                 stdout.append(message)
-                return ProcessReport(ok, stdout=tuple(stdout), stats=optional_stats(record, result, options))
+                return ProcessReport(
+                    ok,
+                    stdout=tuple(stdout),
+                    stderr=tuple(stderr),
+                    stats=optional_stats(record, result, options),
+                )
             if target is None:
                 stderr.append(f"{record.display}: no output mode selected")
                 return ProcessReport(
@@ -355,6 +381,7 @@ def stats_record(record: InputPdf, result: OptimizationResult) -> dict[str, obje
         "output_rel": record.output_rel.as_posix(),
         "original_size": result.original_size,
         "original_page_count": result.original_page_count,
+        "source_error": result.source_error,
         "best_plan": plan_label(result.best.plan),
         "best_methods": [method.value for method in result.best.plan],
         "best_size": result.best.size,
@@ -362,6 +389,8 @@ def stats_record(record: InputPdf, result: OptimizationResult) -> dict[str, obje
         "saved_percent": result.saved_percent,
         "reduced": result.reduced,
         "attempted_plans": result.attempted_plans,
+        "successful_plans": result.successful_plans,
+        "all_plans_failed": result.all_plans_failed,
         "unavailable_methods": [method.value for method in result.unavailable_methods],
         "plans": [
             {
@@ -379,6 +408,10 @@ def stats_record(record: InputPdf, result: OptimizationResult) -> dict[str, obje
                     else None
                 ),
                 "error": plan_result.error,
+                "verification": [
+                    verification_stats_record(verification_result)
+                    for verification_result in plan_result.verification_results
+                ],
             }
             for plan_result in result.plan_results
         ],
@@ -414,6 +447,8 @@ def write_stats_file(
             "plan_spec": options.plan_spec,
             "plans": [[method.value for method in plan] for plan in options.plans],
             "unavailable_methods": [method.value for method in options.unavailable_methods],
+            "test_spec": options.test_spec,
+            "verification": [verification_check_stats_record(check) for check in options.verification_checks],
             "inputs": [path.as_posix() for path in options.inputs],
         },
         "input_count": len(records),
@@ -421,6 +456,38 @@ def write_stats_file(
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def result_warnings(display: str, result: OptimizationResult) -> tuple[str, ...]:
+    if result.source_failed:
+        return (
+            f"{display}: warning: input could not be opened as PDF; "
+            f"treating as incompressible: {result.source_error}",
+        )
+    if result.all_plans_failed:
+        return (f"{display}: warning: all optimization plans failed; treating as incompressible",)
+    return ()
+
+
+def verification_check_stats_record(check: VerificationCheck) -> dict[str, object]:
+    return {
+        "tool": check.tool.value,
+        "test": check.test.value,
+        "slack": check.slack,
+        "strip_ws": check.strip_ws,
+    }
+
+
+def verification_stats_record(result: VerificationResult) -> dict[str, object]:
+    return {
+        **verification_check_stats_record(result.check),
+        "ok": result.ok,
+        "original_count": result.original_count,
+        "candidate_count": result.candidate_count,
+        "delta": result.delta,
+        "allowed_delta": result.allowed_delta,
+        "error": result.error,
+    }
 
 
 def dry_run_action(record: InputPdf, options: CliOptions, result: OptimizationResult) -> str:

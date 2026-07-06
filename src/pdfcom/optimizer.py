@@ -46,6 +46,33 @@ class Candidate:
     size: int
 
 
+class VerificationTool(StrEnum):
+    PDF2TEXT = "pdf2text"
+
+
+class VerificationTest(StrEnum):
+    CHARCOUNT = "charcount"
+
+
+@dataclass(frozen=True)
+class VerificationCheck:
+    tool: VerificationTool
+    test: VerificationTest
+    slack: float = 0.0
+    strip_ws: bool = False
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    check: VerificationCheck
+    ok: bool
+    original_count: int | None = None
+    candidate_count: int | None = None
+    delta: int | None = None
+    allowed_delta: float | None = None
+    error: str | None = None
+
+
 @dataclass(frozen=True)
 class PlanResult:
     plan: tuple[Method, ...]
@@ -53,6 +80,7 @@ class PlanResult:
     size: int | None = None
     page_count: int | None = None
     error: str | None = None
+    verification_results: tuple[VerificationResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -66,12 +94,13 @@ class PlanSelection:
 class OptimizationResult:
     source: Path
     original_size: int
-    original_page_count: int
+    original_page_count: int | None
     best: Candidate
     attempted_plans: int
     failed_plans: dict[str, str]
     unavailable_methods: tuple[Method, ...]
     plan_results: tuple[PlanResult, ...]
+    source_error: str | None = None
 
     @property
     def reduced(self) -> bool:
@@ -86,6 +115,18 @@ class OptimizationResult:
         if self.original_size == 0:
             return 0.0
         return self.saved_bytes / self.original_size * 100
+
+    @property
+    def successful_plans(self) -> int:
+        return sum(1 for result in self.plan_results if result.ok)
+
+    @property
+    def all_plans_failed(self) -> bool:
+        return self.attempted_plans > 0 and self.successful_plans == 0
+
+    @property
+    def source_failed(self) -> bool:
+        return self.source_error is not None
 
 
 def plan_label(plan: tuple[Method, ...]) -> str:
@@ -116,6 +157,76 @@ def select_full_permutation_plans() -> PlanSelection:
         plans=plans,
         unavailable_methods=unavailable,
     )
+
+
+def parse_verification_spec(spec: str | None) -> tuple[VerificationCheck, ...]:
+    if spec is None or not spec.strip():
+        return ()
+
+    checks = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            raise ValueError("empty verification test spec")
+        checks.append(parse_verification_item(item))
+    return tuple(checks)
+
+
+def parse_verification_item(item: str) -> VerificationCheck:
+    terms = [term.strip() for term in item.split(":")]
+    if any(not term for term in terms):
+        raise ValueError(f"invalid verification test spec: {item}")
+
+    tool_name = terms[0]
+    try:
+        tool = VerificationTool(tool_name)
+    except ValueError as exc:
+        raise ValueError(f"unknown verification tool: {tool_name}") from exc
+
+    test_name = terms[1] if len(terms) > 1 else VerificationTest.CHARCOUNT.value
+    try:
+        test = VerificationTest(test_name)
+    except ValueError as exc:
+        raise ValueError(f"unknown verification test: {test_name}") from exc
+
+    if tool is not VerificationTool.PDF2TEXT or test is not VerificationTest.CHARCOUNT:
+        raise ValueError(f"unsupported verification test: {tool.value}:{test.value}")
+
+    slack = 0.0
+    strip_ws = False
+    seen_params: set[str] = set()
+    for param in terms[2:]:
+        name, separator, value = param.partition("=")
+        if name in seen_params:
+            raise ValueError(f"duplicate verification parameter: {name}")
+        seen_params.add(name)
+        if name == "slack":
+            if not separator:
+                raise ValueError("verification parameter requires a value: slack")
+            try:
+                slack = float(value)
+            except ValueError as exc:
+                raise ValueError(f"invalid slack value: {value}") from exc
+            if slack < 0:
+                raise ValueError("slack must be non-negative")
+        elif name == "strip-ws":
+            if separator:
+                strip_ws = parse_bool_param(name, value)
+            else:
+                strip_ws = True
+        else:
+            raise ValueError(f"unknown verification parameter: {name}")
+
+    return VerificationCheck(tool=tool, test=test, slack=slack, strip_ws=strip_ws)
+
+
+def parse_bool_param(name: str, value: str) -> bool:
+    normalized = value.lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean value for {name}: {value}")
 
 
 def unavailable_methods(methods: tuple[Method, ...]) -> tuple[Method, ...]:
@@ -275,6 +386,7 @@ def optimize_pdf(
     *,
     plans: tuple[tuple[Method, ...], ...] | None = None,
     unavailable_methods: tuple[Method, ...] = (),
+    verification_checks: tuple[VerificationCheck, ...] = (),
 ) -> Iterator[OptimizationResult]:
     with tempfile.TemporaryDirectory(prefix="pdfcom-") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
@@ -287,6 +399,7 @@ def optimize_pdf(
             temp_dir,
             plans=plans,
             unavailable_methods=unavailable_methods,
+            verification_checks=verification_checks,
         )
 
 
@@ -296,18 +409,34 @@ def _optimize_pdf(
     *,
     plans: tuple[tuple[Method, ...], ...] | None = None,
     unavailable_methods: tuple[Method, ...] = (),
+    verification_checks: tuple[VerificationCheck, ...] = (),
 ) -> OptimizationResult:
     source = source.resolve()
     original_size = source.stat().st_size
-    original_page_count = page_count(source)
     best = Candidate((), source, original_size)
     if plans is None:
         selection = select_plans()
         plans = selection.plans
         unavailable_methods = selection.unavailable_methods
+    try:
+        original_page_count = page_count(source)
+    except Exception as exc:  # noqa: BLE001 - copy unreadable PDFs through with a warning.
+        error = str(exc)
+        return OptimizationResult(
+            source=source,
+            original_size=original_size,
+            original_page_count=None,
+            best=best,
+            attempted_plans=0,
+            failed_plans={"source": error},
+            unavailable_methods=unavailable_methods,
+            plan_results=(),
+            source_error=error,
+        )
     failures: dict[str, str] = {}
     plan_results: list[PlanResult] = []
     attempted = 0
+    verification_runner = VerificationRunner(source, verification_checks)
 
     for plan_index, plan in enumerate(plans, start=1):
         attempted += 1
@@ -327,12 +456,32 @@ def _optimize_pdf(
                     "page count changed "
                     f"from {original_page_count} to {candidate_page_count}"
                 )
+            verification_results = verification_runner.run(current)
+            failed_verification = next(
+                (result for result in verification_results if not result.ok),
+                None,
+            )
+            if failed_verification is not None:
+                error = verification_error_message(failed_verification)
+                failures[plan_label(plan)] = error
+                plan_results.append(
+                    PlanResult(
+                        plan=plan,
+                        ok=False,
+                        size=candidate_size,
+                        page_count=candidate_page_count,
+                        error=error,
+                        verification_results=verification_results,
+                    )
+                )
+                continue
             plan_results.append(
                 PlanResult(
                     plan=plan,
                     ok=True,
                     size=candidate_size,
                     page_count=candidate_page_count,
+                    verification_results=verification_results,
                 )
             )
             if candidate_size < best.size:
@@ -360,6 +509,81 @@ def page_count(path: Path) -> int:
     except Exception:
         with pymupdf.open(path) as document:
             return document.page_count
+
+
+class VerificationRunner:
+    def __init__(self, source: Path, checks: tuple[VerificationCheck, ...]) -> None:
+        self.source = source
+        self.checks = checks
+        self._pdf2text_cache: dict[Path, str] = {}
+
+    def run(self, candidate: Path) -> tuple[VerificationResult, ...]:
+        return tuple(self._run_check(check, candidate) for check in self.checks)
+
+    def _run_check(self, check: VerificationCheck, candidate: Path) -> VerificationResult:
+        if check.tool is VerificationTool.PDF2TEXT and check.test is VerificationTest.CHARCOUNT:
+            return self._run_charcount_check(check, candidate)
+        return VerificationResult(
+            check=check,
+            ok=False,
+            error=f"unsupported verification test: {check.tool.value}:{check.test.value}",
+        )
+
+    def _run_charcount_check(self, check: VerificationCheck, candidate: Path) -> VerificationResult:
+        try:
+            original_text = self._pdf2text(self.source)
+            candidate_text = self._pdf2text(candidate)
+        except Exception as exc:  # noqa: BLE001 - report this as a failed verification.
+            return VerificationResult(check=check, ok=False, error=str(exc))
+
+        original_count = charcount(original_text, strip_ws=check.strip_ws)
+        candidate_count = charcount(candidate_text, strip_ws=check.strip_ws)
+        delta = abs(candidate_count - original_count)
+        allowed_delta = original_count * check.slack
+        ok = delta <= allowed_delta
+        error = None
+        if not ok:
+            error = (
+                f"charcount delta {delta} exceeds allowed delta {allowed_delta:g} "
+                f"(original {original_count}, candidate {candidate_count})"
+            )
+        return VerificationResult(
+            check=check,
+            ok=ok,
+            original_count=original_count,
+            candidate_count=candidate_count,
+            delta=delta,
+            allowed_delta=allowed_delta,
+            error=error,
+        )
+
+    def _pdf2text(self, path: Path) -> str:
+        resolved = path.resolve()
+        text = self._pdf2text_cache.get(resolved)
+        if text is None:
+            text = extract_pdf2text(path)
+            self._pdf2text_cache[resolved] = text
+        return text
+
+
+def extract_pdf2text(path: Path) -> str:
+    with pymupdf.open(path) as document:
+        if document.needs_pass:
+            raise RuntimeError("encrypted PDF requires a password")
+        return "".join(page.get_text() for page in document)
+
+
+def charcount(text: str, *, strip_ws: bool) -> int:
+    if strip_ws:
+        return sum(1 for char in text if not char.isspace())
+    return len(text)
+
+
+def verification_error_message(result: VerificationResult) -> str:
+    label = f"{result.check.tool.value}:{result.check.test.value}"
+    if result.error is None:
+        return f"verification failed: {label}"
+    return f"verification failed: {label}: {result.error}"
 
 
 def run_method(method: Method, source: Path, output: Path) -> None:

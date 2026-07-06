@@ -25,9 +25,14 @@ from pdfcom.optimizer import (
     Method,
     OptimizationResult,
     PlanResult,
+    VerificationCheck,
+    VerificationResult,
+    VerificationTest,
+    VerificationTool,
     _optimize_pdf,
     expand_plan_spec,
     optimization_plans,
+    parse_verification_spec,
     plan_label,
     run_pikepdf,
     run_qpdf,
@@ -206,6 +211,12 @@ def test_parser_accepts_stats_file() -> None:
     assert namespace.stats_file == Path("stats.json")
 
 
+def test_parser_accepts_verification_test_spec() -> None:
+    namespace = build_parser().parse_args(["-t", "pdf2text:charcount:slack=0.02", "-n", "one.pdf"])
+
+    assert namespace.test_spec == "pdf2text:charcount:slack=0.02"
+
+
 def test_parser_rejects_zero_workers() -> None:
     with pytest.raises(SystemExit):
         build_parser().parse_args(["-w", "0", "-n", "one.pdf"])
@@ -252,6 +263,8 @@ def test_process_records_streams_unordered_worker_results(monkeypatch: pytest.Mo
         plan_spec="q",
         plans=((Method.QPDF,),),
         unavailable_methods=(),
+        test_spec=None,
+        verification_checks=(),
         stats_file=None,
         inputs=(),
     )
@@ -281,6 +294,145 @@ def test_pikepdf_page_copy_warning_disqualifies_plan(
 
     assert result.best == Candidate((), source.resolve(), len(b"original"))
     assert result.failed_plans == {"pikepdf": "orphaned form widgets"}
+
+
+def test_verification_spec_minigrammar_examples() -> None:
+    assert parse_verification_spec(None) == ()
+    assert parse_verification_spec("pdf2text") == (
+        VerificationCheck(VerificationTool.PDF2TEXT, VerificationTest.CHARCOUNT),
+    )
+    assert parse_verification_spec(
+        "pdf2text:charcount:slack=0.02,pdf2text:charcount:slack=0.01:strip-ws"
+    ) == (
+        VerificationCheck(VerificationTool.PDF2TEXT, VerificationTest.CHARCOUNT, slack=0.02),
+        VerificationCheck(
+            VerificationTool.PDF2TEXT,
+            VerificationTest.CHARCOUNT,
+            slack=0.01,
+            strip_ws=True,
+        ),
+    )
+
+
+def test_verification_charcount_failure_disqualifies_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"original pdf bytes")
+    checks = parse_verification_spec("pdf2text:charcount:slack=0.1")
+
+    monkeypatch.setattr("pdfcom.optimizer.page_count", lambda path: 1)
+
+    def write_smaller_output(method: Method, source: Path, output: Path) -> None:
+        output.write_bytes(b"small")
+
+    def fake_pdf2text(path: Path) -> str:
+        if path.name == "source.pdf":
+            return "abcdefghij"
+        return "abc"
+
+    monkeypatch.setattr("pdfcom.optimizer.run_method", write_smaller_output)
+    monkeypatch.setattr("pdfcom.optimizer.extract_pdf2text", fake_pdf2text)
+
+    result = _optimize_pdf(
+        source,
+        tmp_path,
+        plans=((Method.QPDF,),),
+        verification_checks=checks,
+    )
+
+    assert result.best == Candidate((), source.resolve(), len(b"original pdf bytes"))
+    assert result.failed_plans == {
+        "qpdf": "verification failed: pdf2text:charcount: charcount delta 7 exceeds allowed delta 1 (original 10, candidate 3)"
+    }
+    assert result.all_plans_failed is True
+    plan_result = result.plan_results[0]
+    assert plan_result.size == len(b"small")
+    assert plan_result.page_count == 1
+    assert plan_result.verification_results == (
+        VerificationResult(
+            checks[0],
+            ok=False,
+            original_count=10,
+            candidate_count=3,
+            delta=7,
+            allowed_delta=1.0,
+            error="charcount delta 7 exceeds allowed delta 1 (original 10, candidate 3)",
+        ),
+    )
+
+
+def test_all_failed_plans_warn_but_do_not_fail_job(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.pdf"
+    touch(source)
+
+    class FakeOptimizePdf:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> OptimizationResult:
+            return OptimizationResult(
+                source=source,
+                original_size=source.stat().st_size,
+                original_page_count=1,
+                best=Candidate((), source, source.stat().st_size),
+                attempted_plans=1,
+                failed_plans={"qpdf": "boom"},
+                unavailable_methods=(),
+                plan_results=(PlanResult((Method.QPDF,), ok=False, error="boom"),),
+            )
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    monkeypatch.setattr("pdfcom.cli.optimize_pdf", FakeOptimizePdf)
+    record = InputPdf(source, source.as_posix(), Path(source.name))
+    options = CliOptions(
+        dry_run=True,
+        recurse=False,
+        inplace=False,
+        output_dir=None,
+        clobber=False,
+        workers=1,
+        plan_spec="q",
+        plans=((Method.QPDF,),),
+        unavailable_methods=(),
+        test_spec=None,
+        verification_checks=(),
+        stats_file=None,
+        inputs=(),
+    )
+
+    report = next(process_records([record], options))
+
+    assert report.ok is True
+    assert report.stderr == (
+        f"{source}: warning: all optimization plans failed; treating as incompressible",
+    )
+    assert report.stdout[-1] == f"{source}: dry run only; no output mode selected"
+
+
+def test_unreadable_source_pdf_warns_and_copies_original(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"not a pdf")
+    output_dir = tmp_path / "out"
+
+    def fail_page_count(path: Path) -> int:
+        raise RuntimeError("bad pdf")
+
+    monkeypatch.setattr("pdfcom.optimizer.page_count", fail_page_count)
+
+    assert run(["-p", "q", "-o", str(output_dir), str(source)]) == 0
+
+    output = output_dir / "source.pdf"
+    assert output.read_bytes() == b"not a pdf"
 
 
 def test_run_pikepdf_treats_page_copy_warning_as_error(
@@ -350,14 +502,27 @@ def test_run_writes_stats_file(
             *,
             plans: tuple[tuple[Method, ...], ...],
             unavailable_methods: tuple[Method, ...],
+            verification_checks: tuple[VerificationCheck, ...],
         ) -> None:
             assert plans == ((Method.QPDF,),)
             assert unavailable_methods == ()
+            assert verification_checks == (
+                VerificationCheck(
+                    VerificationTool.PDF2TEXT,
+                    VerificationTest.CHARCOUNT,
+                    slack=0.02,
+                ),
+            )
             self.source = source
 
         def __enter__(self) -> OptimizationResult:
             original_size = self.source.stat().st_size
             best_size = original_size - 2
+            check = VerificationCheck(
+                VerificationTool.PDF2TEXT,
+                VerificationTest.CHARCOUNT,
+                slack=0.02,
+            )
             return OptimizationResult(
                 source=self.source,
                 original_size=original_size,
@@ -368,7 +533,22 @@ def test_run_writes_stats_file(
                 unavailable_methods=(Method.GHOSTSCRIPT,),
                 plan_results=(
                     PlanResult((Method.PIKEPDF,), ok=False, error="warning"),
-                    PlanResult((Method.QPDF,), ok=True, size=best_size, page_count=1),
+                    PlanResult(
+                        (Method.QPDF,),
+                        ok=True,
+                        size=best_size,
+                        page_count=1,
+                        verification_results=(
+                            VerificationResult(
+                                check,
+                                ok=True,
+                                original_count=100,
+                                candidate_count=99,
+                                delta=1,
+                                allowed_delta=2.0,
+                            ),
+                        ),
+                    ),
                 ),
             )
 
@@ -379,14 +559,36 @@ def test_run_writes_stats_file(
     monkeypatch.setattr("pdfcom.cli.select_plans", lambda spec: select_plans(spec))
     monkeypatch.setattr("pdfcom.optimizer.shutil.which", lambda command: f"/usr/bin/{command}")
 
-    assert run(["-p", "q", "-n", "-s", str(stats_file), str(source)]) == 0
+    assert run(
+        [
+            "-p",
+            "q",
+            "-t",
+            "pdf2text:charcount:slack=0.02",
+            "-n",
+            "-s",
+            str(stats_file),
+            str(source),
+        ]
+    ) == 0
 
     payload = json.loads(stats_file.read_text())
     assert payload["version"] == 1
     assert payload["options"]["plan_spec"] == "q"
     assert payload["options"]["plans"] == [["qpdf"]]
+    assert payload["options"]["test_spec"] == "pdf2text:charcount:slack=0.02"
+    assert payload["options"]["verification"] == [
+        {
+            "slack": 0.02,
+            "strip_ws": False,
+            "test": "charcount",
+            "tool": "pdf2text",
+        }
+    ]
     assert payload["input_count"] == 1
+    assert payload["results"][0]["all_plans_failed"] is False
     assert payload["results"][0]["best_plan"] == "qpdf"
+    assert payload["results"][0]["successful_plans"] == 1
     plans = payload["results"][0]["plans"]
     assert plans[0] == [
         {
@@ -398,6 +600,7 @@ def test_run_writes_stats_file(
             "saved_bytes": None,
             "saved_percent": None,
             "size": None,
+            "verification": [],
         },
     ][0]
     assert plans[1]["error"] is None
@@ -407,3 +610,17 @@ def test_run_writes_stats_file(
     assert plans[1]["plan"] == "qpdf"
     assert plans[1]["saved_bytes"] == 2
     assert plans[1]["size"] == source.stat().st_size - 2
+    assert plans[1]["verification"] == [
+        {
+            "allowed_delta": 2.0,
+            "candidate_count": 99,
+            "delta": 1,
+            "error": None,
+            "ok": True,
+            "original_count": 100,
+            "slack": 0.02,
+            "strip_ws": False,
+            "test": "charcount",
+            "tool": "pdf2text",
+        }
+    ]

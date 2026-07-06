@@ -15,6 +15,7 @@ pdfcom [options] <pdf_file_or_dir> [pdf_file_or_dir...]
 -p <spec>   use a compression plan spec
 -P          try all non-empty permutations of all methods
 -r          recurse into input directories
+-t <spec>   run post-compression verification tests
 -s <file>   write per-plan optimization stats as JSON
 -w <n>      use n worker processes
 -i          replace reduced PDFs in place
@@ -54,6 +55,11 @@ smallest valid result.
 
 Files that cannot be made smaller are copied unchanged in `-o` mode and left
 alone in `-i` mode.
+
+If the input cannot be opened as a PDF, or all optimization plans fail,
+`pdfcom` treats the input as incompressible: it warns, copies the original in
+`-o` mode, and leaves the original alone in `-i` mode. Failed plans and source
+open errors are recorded in stats output when `-s` is used.
 
 Use `-w` to process multiple input PDFs in parallel. The pool uses Python's
 spawn multiprocessing context, so each worker process runs an independent PDF
@@ -99,6 +105,31 @@ Use `-P` as a shortcut for the full permutation plan:
 {gs?,pike?,mu?,q?}
 ```
 
+## Verification Tests
+
+Use `-t` to require post-compression verification before a compressed candidate
+can be selected:
+
+```bash
+pdfcom -t 'pdf2text:charcount:slack=0.02,pdf2text:charcount:slack=0.01:strip-ws' -o compressed foo.pdf
+```
+
+Verification specs are comma-separated test-tool specs:
+
+```text
+ttspec = toolname[:tspec]
+tspec  = testname[:tpspec...]
+tpspec = p[=v]
+```
+
+The first supported verifier is `pdf2text:charcount`. It extracts text with
+PyMuPDF, compares original and candidate character counts, and accepts the
+candidate when the absolute count difference is within `slack` of the original
+count. `slack=0.02` allows a 2% difference. `strip-ws` removes whitespace before
+counting. If a candidate fails verification, that plan is disqualified and
+`pdfcom` continues trying the remaining plans.
+
 Use `-s` to write a JSON stats file with one result per input PDF. Each result
-includes the winning plan, unavailable methods, failed plans, and per-plan
-sizes so method order and marginal savings can be analyzed after a run.
+includes the winning plan, unavailable methods, failed plans, verification
+results, and per-plan sizes so method order and marginal savings can be analyzed
+after a run.
