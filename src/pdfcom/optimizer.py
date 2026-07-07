@@ -24,17 +24,8 @@ class Method(StrEnum):
     QPDF_ZOPFLI = "qpdf-zopfli"
 
 
-# Methods used by the default full-permutation shortcut. qpdf-zopfli is
-# intentionally opt-in through -p because it is much slower than qpdf/zlib.
-ALL_METHODS: tuple[Method, ...] = (
-    Method.GHOSTSCRIPT,
-    Method.PIKEPDF,
-    Method.PYMUPDF,
-    Method.QPDF,
-)
-
-DEFAULT_PLAN_SPEC = "gs?,{mu?,pike?},q"
-FULL_PERMUTATION_PLAN_SPEC = "{gs?,pike?,mu?,q?}"
+DEFAULT_PLAN = "gs?,{mu?,pike?},q"
+DEFAULT_PLAN_SPEC = DEFAULT_PLAN
 METHOD_NAMES = {
     "gs": Method.GHOSTSCRIPT,
     "pike": Method.PIKEPDF,
@@ -140,43 +131,33 @@ def plan_label(plan: tuple[Method, ...]) -> str:
     return "+".join(method.value for method in plan)
 
 
-def select_plans(spec: str = DEFAULT_PLAN_SPEC) -> PlanSelection:
+def select_plans(spec: str = DEFAULT_PLAN) -> PlanSelection:
     requested_plans = expand_plan_spec(spec)
-    requested_methods = tuple(dict.fromkeys(method for plan in requested_plans for method in plan))
-    unavailable = unavailable_methods(requested_methods)
-    plans = dedupe_plans(
-        tuple(method for method in plan if method not in unavailable)
-        for plan in requested_plans
-    )
-    return PlanSelection(spec=spec, plans=plans, unavailable_methods=unavailable)
+    requested_methods = methods_in_plans(requested_plans)
+    require_methods_available(requested_methods, spec)
+    return PlanSelection(spec=spec, plans=requested_plans, unavailable_methods=())
 
 
 def select_full_permutation_plans() -> PlanSelection:
-    unavailable = unavailable_methods(ALL_METHODS)
-    plans = dedupe_plans(
-        tuple(method for method in plan if method not in unavailable)
-        for plan in optimization_plans(ALL_METHODS)
-    )
-    return PlanSelection(
-        spec=FULL_PERMUTATION_PLAN_SPEC,
-        plans=plans,
-        unavailable_methods=unavailable,
-    )
+    return select_plan_method_permutations(DEFAULT_PLAN)
 
 
 def select_plan_method_permutations(spec: str) -> PlanSelection:
     methods = methods_in_plan_spec(spec)
-    unavailable = unavailable_methods(methods)
-    available_methods = tuple(method for method in methods if method not in unavailable)
+    require_methods_available(methods, spec)
     return PlanSelection(
         spec=spec,
-        plans=tuple(optimization_plans(available_methods)),
-        unavailable_methods=unavailable,
+        plans=tuple(optimization_plans(methods)),
+        unavailable_methods=(),
     )
 
 
 def methods_in_plan_spec(spec: str) -> tuple[Method, ...]:
-    return tuple(dict.fromkeys(method for plan in expand_plan_spec(spec) for method in plan))
+    return methods_in_plans(expand_plan_spec(spec))
+
+
+def methods_in_plans(plans: tuple[tuple[Method, ...], ...]) -> tuple[Method, ...]:
+    return tuple(dict.fromkeys(method for plan in plans for method in plan))
 
 
 def parse_verification_spec(spec: str | None) -> tuple[VerificationCheck, ...]:
@@ -247,6 +228,25 @@ def parse_bool_param(name: str, value: str) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"invalid boolean value for {name}: {value}")
+
+
+def require_methods_available(methods: tuple[Method, ...], spec: str) -> None:
+    unavailable = unavailable_methods(methods)
+    if not unavailable:
+        return
+
+    details = ", ".join(unavailable_method_message(method) for method in unavailable)
+    raise ValueError(f"plan spec {spec!r} requires unavailable method(s): {details}")
+
+
+def unavailable_method_message(method: Method) -> str:
+    if method is Method.GHOSTSCRIPT:
+        return "ghostscript (requires executable on PATH: gs)"
+    if method is Method.QPDF:
+        return "qpdf (requires executable on PATH: qpdf)"
+    if method is Method.QPDF_ZOPFLI:
+        return "qpdf-zopfli (requires qpdf with zopfli support)"
+    return method.value
 
 
 def unavailable_methods(methods: tuple[Method, ...]) -> tuple[Method, ...]:

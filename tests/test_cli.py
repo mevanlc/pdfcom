@@ -20,8 +20,8 @@ from pdfcom.cli import (
 )
 from pdfcom.optimizer import (
     Candidate,
+    DEFAULT_PLAN,
     DEFAULT_PLAN_SPEC,
-    FULL_PERMUTATION_PLAN_SPEC,
     Method,
     OptimizationResult,
     PlanResult,
@@ -123,6 +123,7 @@ def test_default_plan_spec_uses_qpdf_last_shape(monkeypatch: pytest.MonkeyPatch)
 
     selection = select_plans()
 
+    assert DEFAULT_PLAN_SPEC == DEFAULT_PLAN
     assert selection.spec == DEFAULT_PLAN_SPEC
     assert selection.unavailable_methods == ()
     assert selection.plans == (
@@ -143,11 +144,13 @@ def test_full_permutation_selection_tries_all_lengths(monkeypatch: pytest.Monkey
     monkeypatch.setattr("pdfcom.optimizer.shutil.which", lambda command: f"/usr/bin/{command}")
 
     selection = select_full_permutation_plans()
+    explicit_selection = select_plan_method_permutations(DEFAULT_PLAN)
 
-    assert selection.spec == FULL_PERMUTATION_PLAN_SPEC
+    assert selection == explicit_selection
+    assert selection.spec == DEFAULT_PLAN
     assert selection.unavailable_methods == ()
     assert selection.plans == tuple(
-        optimization_plans((Method.GHOSTSCRIPT, Method.PIKEPDF, Method.PYMUPDF, Method.QPDF))
+        optimization_plans((Method.GHOSTSCRIPT, Method.PYMUPDF, Method.PIKEPDF, Method.QPDF))
     )
     assert (Method.QPDF,) in selection.plans
     assert (Method.GHOSTSCRIPT, Method.QPDF, Method.PYMUPDF, Method.PIKEPDF) in selection.plans
@@ -174,23 +177,21 @@ def test_full_permutation_selection_can_use_plan_method_set(
     )
 
 
-def test_plan_selection_drops_unavailable_executables(
+def test_plan_selection_rejects_unavailable_executables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("pdfcom.optimizer.shutil.which", lambda command: None)
 
-    selection = select_plans("gs?,{mu?,pike?},q")
+    with pytest.raises(ValueError) as excinfo:
+        select_plans(DEFAULT_PLAN)
 
-    assert selection.unavailable_methods == (Method.GHOSTSCRIPT, Method.QPDF)
-    assert selection.plans == (
-        (Method.PYMUPDF, Method.PIKEPDF),
-        (Method.PIKEPDF, Method.PYMUPDF),
-        (Method.PYMUPDF,),
-        (Method.PIKEPDF,),
-    )
+    message = str(excinfo.value)
+    assert f"plan spec {DEFAULT_PLAN!r} requires unavailable method(s)" in message
+    assert "ghostscript (requires executable on PATH: gs)" in message
+    assert "qpdf (requires executable on PATH: qpdf)" in message
 
 
-def test_plan_selection_drops_qpdf_zopfli_without_support(
+def test_plan_selection_rejects_qpdf_zopfli_without_support(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -201,10 +202,11 @@ def test_plan_selection_drops_qpdf_zopfli_without_support(
     monkeypatch.setattr("pdfcom.optimizer.shutil.which", lambda command: f"/usr/bin/{command}")
     monkeypatch.setattr("pdfcom.optimizer.subprocess.run", fake_run)
 
-    selection = select_plans("q,qz")
+    with pytest.raises(ValueError) as excinfo:
+        select_plans("q,qz")
 
-    assert selection.unavailable_methods == (Method.QPDF_ZOPFLI,)
-    assert selection.plans == ((Method.QPDF,),)
+    message = str(excinfo.value)
+    assert "qpdf-zopfli (requires qpdf with zopfli support)" in message
 
 
 def test_plan_selection_keeps_qpdf_zopfli_with_support(
@@ -266,6 +268,49 @@ def test_parser_accepts_plan_spec_with_full_permutation_shortcut() -> None:
 
     assert namespace.full_permutation is True
     assert namespace.plan_spec == "q"
+
+
+def test_run_full_permutation_shortcut_uses_default_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.pdf"
+    touch(source)
+    captured: list[CliOptions] = []
+    monkeypatch.setattr("pdfcom.optimizer.shutil.which", lambda command: f"/usr/bin/{command}")
+
+    def fake_process_records(records: list[InputPdf], options: CliOptions) -> tuple[ProcessReport, ...]:
+        assert records
+        captured.append(options)
+        return (ProcessReport(True),)
+
+    monkeypatch.setattr("pdfcom.cli.process_records", fake_process_records)
+
+    assert run(["-P", "-n", str(source)]) == 0
+    assert run(["-P", "-p", DEFAULT_PLAN, "-n", str(source)]) == 0
+
+    assert captured[0].plan_spec == DEFAULT_PLAN
+    assert captured[1].plan_spec == DEFAULT_PLAN
+    assert captured[0].plans == captured[1].plans
+
+
+def test_run_rejects_unavailable_default_plan_members(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.pdf"
+    touch(source)
+    monkeypatch.setattr("pdfcom.optimizer.shutil.which", lambda command: None)
+
+    with pytest.raises(SystemExit) as excinfo:
+        run(["-n", str(source)])
+
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert f"plan spec {DEFAULT_PLAN!r} requires unavailable method(s)" in captured.err
+    assert "ghostscript (requires executable on PATH: gs)" in captured.err
+    assert "qpdf (requires executable on PATH: qpdf)" in captured.err
 
 
 def test_parser_accepts_stats_file() -> None:
@@ -491,6 +536,7 @@ def test_unreadable_source_pdf_warns_and_copies_original(
         raise RuntimeError("bad pdf")
 
     monkeypatch.setattr("pdfcom.optimizer.page_count", fail_page_count)
+    monkeypatch.setattr("pdfcom.optimizer.shutil.which", lambda command: f"/usr/bin/{command}")
 
     assert run(["-p", "q", "-o", str(output_dir), str(source)]) == 0
 

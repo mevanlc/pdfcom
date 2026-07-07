@@ -75,14 +75,16 @@ gs?,{mu?,pike?},q
 
 That tries Ghostscript in the first position or omits it, tries all
 permutations of PyMuPDF and pikepdf in the middle including either one or
-neither, and applies qpdf last. If `gs` or `qpdf` is not available on `PATH`,
-that method is omitted from the generated plans. The qpdf stage recompresses
-Flate streams with compression level 9 and generates object streams, but does
-not enable lossy image optimization.
+neither, and applies qpdf last. Before processing any inputs, `pdfcom` probes
+every method mentioned in the selected plan spec. If a required executable or
+feature is unavailable, it exits with an explanatory error instead of silently
+omitting that method. The qpdf stage recompresses Flate streams with
+compression level 9 and generates object streams, but does not enable lossy
+image optimization.
 
 Use `qz` in an explicit `-p` plan to run qpdf with zopfli enabled. `pdfcom`
 probes support with `QPDF_ZOPFLI=force qpdf --zopfli`; if the active `qpdf`
-does not support zopfli, `qz` is omitted from the generated plans. zopfli can
+does not support zopfli, `pdfcom` exits with an explanatory error. zopfli can
 produce slightly smaller Flate streams but is much slower than qpdf's normal
 zlib path.
 
@@ -109,11 +111,11 @@ qz                # qpdf with zopfli
 gs?,{mu?,pike?},q # default
 ```
 
-Use `-P` without `-p` as a shortcut for the full permutation plan over the
-regular methods:
+Use `-P` without `-p` as a shortcut for all non-empty method permutations drawn
+from the default plan:
 
 ```text
-{gs?,pike?,mu?,q?}
+gs?,{mu?,pike?},q
 ```
 
 Use `-P` with `-p` to ignore plan ordering and optionality and try all

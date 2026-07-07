@@ -12,13 +12,12 @@ import tempfile
 from typing import Iterable, Sequence
 
 from .optimizer import (
-    DEFAULT_PLAN_SPEC,
+    DEFAULT_PLAN,
     Method,
     OptimizationResult,
     optimize_pdf,
     parse_verification_spec,
     plan_label,
-    select_full_permutation_plans,
     select_plan_method_permutations,
     select_plans,
     VerificationCheck,
@@ -71,12 +70,11 @@ def run(argv: Sequence[str] | None = None) -> int:
         parser.error("one of -i or -o is required unless -n is used")
 
     try:
-        if namespace.full_permutation and namespace.plan_spec is None:
-            plan_selection = select_full_permutation_plans()
-        elif namespace.full_permutation:
-            plan_selection = select_plan_method_permutations(namespace.plan_spec)
+        plan_spec = namespace.plan_spec or DEFAULT_PLAN
+        if namespace.full_permutation:
+            plan_selection = select_plan_method_permutations(plan_spec)
         else:
-            plan_selection = select_plans(namespace.plan_spec or DEFAULT_PLAN_SPEC)
+            plan_selection = select_plans(plan_spec)
         verification_checks = parse_verification_spec(namespace.test_spec)
     except ValueError as exc:
         parser.error(str(exc))
@@ -142,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-p",
         dest="plan_spec",
         metavar="SPEC",
-        help=f"compression plan spec; default: {DEFAULT_PLAN_SPEC}",
+        help=f"compression plan spec; default: {DEFAULT_PLAN}",
     )
     parser.add_argument(
         "-P",
