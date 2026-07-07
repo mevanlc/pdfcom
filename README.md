@@ -13,7 +13,7 @@ pdfcom [options] <pdf_file_or_dir> [pdf_file_or_dir...]
 ```text
 -n          dry run
 -p <spec>   use a compression plan spec
--P          try all non-empty permutations of all methods
+-P          try all non-empty permutations of selected methods
 -r          recurse into input directories
 -t <spec>   run post-compression verification tests
 -s <file>   write per-plan optimization stats as JSON
@@ -52,6 +52,8 @@ smallest valid result.
 - `pikepdf` as a library
 - PyMuPDF as a library using the equivalent of `-ggggz`
 - `qpdf` as a subprocess, when `qpdf` is on `PATH`
+- `qpdf` with zopfli enabled, when selected explicitly and supported by the
+  `qpdf` executable on `PATH`
 
 Files that cannot be made smaller are copied unchanged in `-o` mode and left
 alone in `-i` mode.
@@ -78,6 +80,12 @@ that method is omitted from the generated plans. The qpdf stage recompresses
 Flate streams with compression level 9 and generates object streams, but does
 not enable lossy image optimization.
 
+Use `qz` in an explicit `-p` plan to run qpdf with zopfli enabled. `pdfcom`
+probes support with `QPDF_ZOPFLI=force qpdf --zopfli`; if the active `qpdf`
+does not support zopfli, `qz` is omitted from the generated plans. zopfli can
+produce slightly smaller Flate streams but is much slower than qpdf's normal
+zlib path.
+
 Plan specs use these method names:
 
 ```text
@@ -85,6 +93,7 @@ gs    Ghostscript
 mu    PyMuPDF
 pike  pikepdf
 q     qpdf
+qz    qpdf with zopfli
 ```
 
 Use commas for fixed order, braces for permutations, parentheses for fixed-order
@@ -93,16 +102,26 @@ combinations, and `?` to make the preceding item or group optional:
 ```text
 gs,q              # gs then q
 gs,q?             # gs+q and gs
+qz                # qpdf with zopfli
 {mu,pike}         # mu+pike and pike+mu
 (mu,pike)         # mu+pike only
 {mu?,pike?}       # both orders, either single method, or neither
 gs?,{mu?,pike?},q # default
 ```
 
-Use `-P` as a shortcut for the full permutation plan:
+Use `-P` without `-p` as a shortcut for the full permutation plan over the
+regular methods:
 
 ```text
 {gs?,pike?,mu?,q?}
+```
+
+Use `-P` with `-p` to ignore plan ordering and optionality and try all
+non-empty permutations of every method mentioned in the `-p` spec:
+
+```text
+-P -p q,qz          # q, qz, q+qz, and qz+q
+-P -p gs,{mu,qz}   # every non-empty permutation of gs, mu, and qz
 ```
 
 ## Verification Tests

@@ -37,6 +37,7 @@ from pdfcom.optimizer import (
     run_pikepdf,
     run_qpdf,
     select_full_permutation_plans,
+    select_plan_method_permutations,
     select_plans,
 )
 
@@ -112,6 +113,11 @@ def test_optimizer_plans_include_qpdf_in_full_permutations() -> None:
     assert (Method.GHOSTSCRIPT, Method.QPDF, Method.PYMUPDF, Method.PIKEPDF) in plans
 
 
+def test_plan_spec_accepts_qpdf_zopfli_method() -> None:
+    assert expand_plan_spec("qz") == ((Method.QPDF_ZOPFLI,),)
+    assert plan_label((Method.QPDF_ZOPFLI,)) == "qpdf-zopfli"
+
+
 def test_default_plan_spec_uses_qpdf_last_shape(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("pdfcom.optimizer.shutil.which", lambda command: f"/usr/bin/{command}")
 
@@ -147,6 +153,27 @@ def test_full_permutation_selection_tries_all_lengths(monkeypatch: pytest.Monkey
     assert (Method.GHOSTSCRIPT, Method.QPDF, Method.PYMUPDF, Method.PIKEPDF) in selection.plans
 
 
+def test_full_permutation_selection_can_use_plan_method_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("pdfcom.optimizer.shutil.which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr(
+        "pdfcom.optimizer.qpdf_zopfli_supported",
+        lambda: True,
+    )
+
+    selection = select_plan_method_permutations("q,qz")
+
+    assert selection.spec == "q,qz"
+    assert selection.unavailable_methods == ()
+    assert selection.plans == (
+        (Method.QPDF,),
+        (Method.QPDF_ZOPFLI,),
+        (Method.QPDF, Method.QPDF_ZOPFLI),
+        (Method.QPDF_ZOPFLI, Method.QPDF),
+    )
+
+
 def test_plan_selection_drops_unavailable_executables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -161,6 +188,40 @@ def test_plan_selection_drops_unavailable_executables(
         (Method.PYMUPDF,),
         (Method.PIKEPDF,),
     )
+
+
+def test_plan_selection_drops_qpdf_zopfli_without_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command == ["/usr/bin/qpdf", "--zopfli"]
+        assert kwargs["env"]["QPDF_ZOPFLI"] == "force"  # type: ignore[index]
+        return subprocess.CompletedProcess(command, 2)
+
+    monkeypatch.setattr("pdfcom.optimizer.shutil.which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr("pdfcom.optimizer.subprocess.run", fake_run)
+
+    selection = select_plans("q,qz")
+
+    assert selection.unavailable_methods == (Method.QPDF_ZOPFLI,)
+    assert selection.plans == ((Method.QPDF,),)
+
+
+def test_plan_selection_keeps_qpdf_zopfli_with_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command == ["/usr/bin/qpdf", "--zopfli"]
+        assert kwargs["env"]["QPDF_ZOPFLI"] == "force"  # type: ignore[index]
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("pdfcom.optimizer.shutil.which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr("pdfcom.optimizer.subprocess.run", fake_run)
+
+    selection = select_plans("qz")
+
+    assert selection.unavailable_methods == ()
+    assert selection.plans == ((Method.QPDF_ZOPFLI,),)
 
 
 def test_plan_spec_minigrammar_examples() -> None:
@@ -200,9 +261,11 @@ def test_parser_accepts_full_permutation_shortcut() -> None:
     assert namespace.full_permutation is True
 
 
-def test_parser_rejects_plan_spec_with_full_permutation_shortcut() -> None:
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["-P", "-p", "q", "-n", "one.pdf"])
+def test_parser_accepts_plan_spec_with_full_permutation_shortcut() -> None:
+    namespace = build_parser().parse_args(["-P", "-p", "q", "-n", "one.pdf"])
+
+    assert namespace.full_permutation is True
+    assert namespace.plan_spec == "q"
 
 
 def test_parser_accepts_stats_file() -> None:
@@ -485,6 +548,30 @@ def test_run_qpdf_uses_lossless_compression_flags(
             str(output),
         ]
     ]
+
+
+def test_run_qpdf_zopfli_forces_zopfli_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    commands: list[list[str]] = []
+    envs: list[dict[str, str] | None] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        envs.append(kwargs["env"])  # type: ignore[arg-type]
+        return subprocess.CompletedProcess(command, 0, stderr="")
+
+    monkeypatch.setattr("pdfcom.optimizer.shutil.which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr("pdfcom.optimizer.subprocess.run", fake_run)
+    source = tmp_path / "source.pdf"
+    output = tmp_path / "output.pdf"
+
+    run_qpdf(source, output, zopfli=True)
+
+    assert commands[0][0] == "/usr/bin/qpdf"
+    assert envs[0] is not None
+    assert envs[0]["QPDF_ZOPFLI"] == "force"
 
 
 def test_run_writes_stats_file(

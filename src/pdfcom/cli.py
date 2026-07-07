@@ -19,6 +19,7 @@ from .optimizer import (
     parse_verification_spec,
     plan_label,
     select_full_permutation_plans,
+    select_plan_method_permutations,
     select_plans,
     VerificationCheck,
     VerificationResult,
@@ -70,10 +71,12 @@ def run(argv: Sequence[str] | None = None) -> int:
         parser.error("one of -i or -o is required unless -n is used")
 
     try:
-        if namespace.full_permutation:
+        if namespace.full_permutation and namespace.plan_spec is None:
             plan_selection = select_full_permutation_plans()
+        elif namespace.full_permutation:
+            plan_selection = select_plan_method_permutations(namespace.plan_spec)
         else:
-            plan_selection = select_plans(namespace.plan_spec)
+            plan_selection = select_plans(namespace.plan_spec or DEFAULT_PLAN_SPEC)
         verification_checks = parse_verification_spec(namespace.test_spec)
     except ValueError as exc:
         parser.error(str(exc))
@@ -135,19 +138,17 @@ def build_parser() -> argparse.ArgumentParser:
         description="Try multiple PDF compression pipelines and keep the smallest valid result.",
     )
     parser.add_argument("-n", dest="dry_run", action="store_true", help="dry run")
-    plan_mode = parser.add_mutually_exclusive_group()
-    plan_mode.add_argument(
+    parser.add_argument(
         "-p",
         dest="plan_spec",
         metavar="SPEC",
-        default=DEFAULT_PLAN_SPEC,
         help=f"compression plan spec; default: {DEFAULT_PLAN_SPEC}",
     )
-    plan_mode.add_argument(
+    parser.add_argument(
         "-P",
         dest="full_permutation",
         action="store_true",
-        help="try all non-empty permutations of all compression methods",
+        help="try all non-empty permutations of methods in the plan spec",
     )
     parser.add_argument("-r", dest="recurse", action="store_true", help="recurse into directories")
     parser.add_argument(

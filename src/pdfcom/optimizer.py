@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from itertools import combinations, permutations, product
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -20,8 +21,11 @@ class Method(StrEnum):
     PIKEPDF = "pikepdf"
     PYMUPDF = "pymupdf"
     QPDF = "qpdf"
+    QPDF_ZOPFLI = "qpdf-zopfli"
 
 
+# Methods used by the default full-permutation shortcut. qpdf-zopfli is
+# intentionally opt-in through -p because it is much slower than qpdf/zlib.
 ALL_METHODS: tuple[Method, ...] = (
     Method.GHOSTSCRIPT,
     Method.PIKEPDF,
@@ -36,6 +40,7 @@ METHOD_NAMES = {
     "pike": Method.PIKEPDF,
     "mu": Method.PYMUPDF,
     "q": Method.QPDF,
+    "qz": Method.QPDF_ZOPFLI,
 }
 
 
@@ -159,6 +164,21 @@ def select_full_permutation_plans() -> PlanSelection:
     )
 
 
+def select_plan_method_permutations(spec: str) -> PlanSelection:
+    methods = methods_in_plan_spec(spec)
+    unavailable = unavailable_methods(methods)
+    available_methods = tuple(method for method in methods if method not in unavailable)
+    return PlanSelection(
+        spec=spec,
+        plans=tuple(optimization_plans(available_methods)),
+        unavailable_methods=unavailable,
+    )
+
+
+def methods_in_plan_spec(spec: str) -> tuple[Method, ...]:
+    return tuple(dict.fromkeys(method for plan in expand_plan_spec(spec) for method in plan))
+
+
 def parse_verification_spec(spec: str | None) -> tuple[VerificationCheck, ...]:
     if spec is None or not spec.strip():
         return ()
@@ -236,7 +256,25 @@ def unavailable_methods(methods: tuple[Method, ...]) -> tuple[Method, ...]:
             unavailable.append(method)
         elif method is Method.QPDF and shutil.which("qpdf") is None:
             unavailable.append(method)
+        elif method is Method.QPDF_ZOPFLI and not qpdf_zopfli_supported():
+            unavailable.append(method)
     return tuple(unavailable)
+
+
+def qpdf_zopfli_supported() -> bool:
+    qpdf = shutil.which("qpdf")
+    if qpdf is None:
+        return False
+
+    completed = subprocess.run(
+        [qpdf, "--zopfli"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+        env=qpdf_zopfli_env(),
+    )
+    return completed.returncode == 0
 
 
 def optimization_plans(methods: tuple[Method, ...]) -> list[tuple[Method, ...]]:
@@ -595,6 +633,8 @@ def run_method(method: Method, source: Path, output: Path) -> None:
         run_pymupdf(source, output)
     elif method is Method.QPDF:
         run_qpdf(source, output)
+    elif method is Method.QPDF_ZOPFLI:
+        run_qpdf(source, output, zopfli=True)
     else:
         raise ValueError(f"unknown optimizer method: {method}")
 
@@ -658,7 +698,13 @@ def run_pymupdf(source: Path, output: Path) -> None:
         document.save(output, garbage=4, deflate=True)
 
 
-def run_qpdf(source: Path, output: Path) -> None:
+def qpdf_zopfli_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["QPDF_ZOPFLI"] = "force"
+    return env
+
+
+def run_qpdf(source: Path, output: Path, *, zopfli: bool = False) -> None:
     qpdf = shutil.which("qpdf")
     if qpdf is None:
         raise RuntimeError("qpdf executable not found: qpdf")
@@ -680,9 +726,11 @@ def run_qpdf(source: Path, output: Path) -> None:
         stderr=subprocess.PIPE,
         text=True,
         check=False,
+        env=qpdf_zopfli_env() if zopfli else None,
     )
     if completed.returncode != 0:
         stderr = completed.stderr.strip()
         if len(stderr) > 500:
             stderr = stderr[-500:]
-        raise RuntimeError(f"qpdf failed with exit {completed.returncode}: {stderr}")
+        label = "qpdf-zopfli" if zopfli else "qpdf"
+        raise RuntimeError(f"{label} failed with exit {completed.returncode}: {stderr}")
