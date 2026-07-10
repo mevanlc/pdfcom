@@ -22,6 +22,7 @@ from .optimizer import (
     select_plans,
     VerificationCheck,
     VerificationResult,
+    VerificationTool,
 )
 
 
@@ -153,7 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-t",
         dest="test_spec",
         metavar="SPEC",
-        help="post-compression verification test spec",
+        help="post-compression verification test specs (pdf2text or render)",
     )
     parser.add_argument(
         "-s",
@@ -469,24 +470,45 @@ def result_warnings(display: str, result: OptimizationResult) -> tuple[str, ...]
 
 
 def verification_check_stats_record(check: VerificationCheck) -> dict[str, object]:
-    return {
+    record: dict[str, object] = {
         "tool": check.tool.value,
         "test": check.test.value,
-        "slack": check.slack,
-        "strip_ws": check.strip_ws,
     }
+    if check.tool is VerificationTool.PDF2TEXT:
+        record.update(slack=check.slack, strip_ws=check.strip_ws)
+    elif check.tool is VerificationTool.RENDER:
+        record.update(
+            dpi=check.dpi,
+            threshold=check.threshold,
+            slack=check.slack,
+            max_delta=check.max_delta,
+        )
+    return record
 
 
 def verification_stats_record(result: VerificationResult) -> dict[str, object]:
-    return {
+    record: dict[str, object] = {
         **verification_check_stats_record(result.check),
         "ok": result.ok,
-        "original_count": result.original_count,
-        "candidate_count": result.candidate_count,
-        "delta": result.delta,
-        "allowed_delta": result.allowed_delta,
         "error": result.error,
     }
+    if result.check.tool is VerificationTool.PDF2TEXT:
+        record.update(
+            original_count=result.original_count,
+            candidate_count=result.candidate_count,
+            delta=result.delta,
+            allowed_delta=result.allowed_delta,
+        )
+    elif result.check.tool is VerificationTool.RENDER:
+        record.update(
+            pages_compared=result.pages_compared,
+            different_pages=list(result.different_pages),
+            total_pixels=result.total_pixels,
+            changed_pixels=result.changed_pixels,
+            changed_ratio=result.changed_ratio,
+            max_channel_delta=result.max_channel_delta,
+        )
+    return record
 
 
 def dry_run_action(record: InputPdf, options: CliOptions, result: OptimizationResult) -> str:

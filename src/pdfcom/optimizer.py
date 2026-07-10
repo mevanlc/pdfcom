@@ -44,10 +44,18 @@ class Candidate:
 
 class VerificationTool(StrEnum):
     PDF2TEXT = "pdf2text"
+    RENDER = "render"
 
 
 class VerificationTest(StrEnum):
     CHARCOUNT = "charcount"
+    PIXELDIFF = "pixeldiff"
+
+
+DEFAULT_RENDER_DPI = 144
+DEFAULT_RENDER_THRESHOLD = 16
+DEFAULT_RENDER_SLACK = 0.001
+DEFAULT_RENDER_MAX_DELTA = 96
 
 
 @dataclass(frozen=True)
@@ -56,6 +64,9 @@ class VerificationCheck:
     test: VerificationTest
     slack: float = 0.0
     strip_ws: bool = False
+    dpi: int = DEFAULT_RENDER_DPI
+    threshold: int = DEFAULT_RENDER_THRESHOLD
+    max_delta: int = DEFAULT_RENDER_MAX_DELTA
 
 
 @dataclass(frozen=True)
@@ -66,6 +77,12 @@ class VerificationResult:
     candidate_count: int | None = None
     delta: int | None = None
     allowed_delta: float | None = None
+    pages_compared: int | None = None
+    different_pages: tuple[int, ...] = ()
+    total_pixels: int | None = None
+    changed_pixels: int | None = None
+    changed_ratio: float | None = None
+    max_channel_delta: int | None = None
     error: str | None = None
 
 
@@ -184,25 +201,45 @@ def parse_verification_item(item: str) -> VerificationCheck:
     except ValueError as exc:
         raise ValueError(f"unknown verification tool: {tool_name}") from exc
 
-    test_name = terms[1] if len(terms) > 1 else VerificationTest.CHARCOUNT.value
+    default_test = {
+        VerificationTool.PDF2TEXT: VerificationTest.CHARCOUNT,
+        VerificationTool.RENDER: VerificationTest.PIXELDIFF,
+    }[tool]
+    test_name = terms[1] if len(terms) > 1 else default_test.value
     try:
         test = VerificationTest(test_name)
     except ValueError as exc:
         raise ValueError(f"unknown verification test: {test_name}") from exc
 
-    if tool is not VerificationTool.PDF2TEXT or test is not VerificationTest.CHARCOUNT:
-        raise ValueError(f"unsupported verification test: {tool.value}:{test.value}")
+    if tool is VerificationTool.PDF2TEXT and test is VerificationTest.CHARCOUNT:
+        return parse_charcount_check(tool, test, terms[2:])
+    if tool is VerificationTool.RENDER and test is VerificationTest.PIXELDIFF:
+        return parse_pixeldiff_check(tool, test, terms[2:])
+    raise ValueError(f"unsupported verification test: {tool.value}:{test.value}")
+
+
+def parse_verification_params(params: list[str]) -> dict[str, str | None]:
+    parsed: dict[str, str | None] = {}
+    for param in params:
+        name, separator, value = param.partition("=")
+        if name in parsed:
+            raise ValueError(f"duplicate verification parameter: {name}")
+        parsed[name] = value if separator else None
+    return parsed
+
+
+def parse_charcount_check(
+    tool: VerificationTool,
+    test: VerificationTest,
+    raw_params: list[str],
+) -> VerificationCheck:
+    params = parse_verification_params(raw_params)
 
     slack = 0.0
     strip_ws = False
-    seen_params: set[str] = set()
-    for param in terms[2:]:
-        name, separator, value = param.partition("=")
-        if name in seen_params:
-            raise ValueError(f"duplicate verification parameter: {name}")
-        seen_params.add(name)
+    for name, value in params.items():
         if name == "slack":
-            if not separator:
+            if value is None:
                 raise ValueError("verification parameter requires a value: slack")
             try:
                 slack = float(value)
@@ -211,7 +248,7 @@ def parse_verification_item(item: str) -> VerificationCheck:
             if slack < 0:
                 raise ValueError("slack must be non-negative")
         elif name == "strip-ws":
-            if separator:
+            if value is not None:
                 strip_ws = parse_bool_param(name, value)
             else:
                 strip_ws = True
@@ -219,6 +256,58 @@ def parse_verification_item(item: str) -> VerificationCheck:
             raise ValueError(f"unknown verification parameter: {name}")
 
     return VerificationCheck(tool=tool, test=test, slack=slack, strip_ws=strip_ws)
+
+
+def parse_pixeldiff_check(
+    tool: VerificationTool,
+    test: VerificationTest,
+    raw_params: list[str],
+) -> VerificationCheck:
+    params = parse_verification_params(raw_params)
+    dpi = DEFAULT_RENDER_DPI
+    threshold = DEFAULT_RENDER_THRESHOLD
+    slack = DEFAULT_RENDER_SLACK
+    max_delta = DEFAULT_RENDER_MAX_DELTA
+
+    for name, value in params.items():
+        if value is None:
+            raise ValueError(f"verification parameter requires a value: {name}")
+        if name == "dpi":
+            dpi = parse_bounded_int(name, value, minimum=1, maximum=1200)
+        elif name == "threshold":
+            threshold = parse_bounded_int(name, value, minimum=0, maximum=255)
+        elif name == "slack":
+            try:
+                slack = float(value)
+            except ValueError as exc:
+                raise ValueError(f"invalid slack value: {value}") from exc
+            if not 0 <= slack <= 1:
+                raise ValueError("render slack must be between 0 and 1")
+        elif name == "max-delta":
+            max_delta = parse_bounded_int(name, value, minimum=0, maximum=255)
+        else:
+            raise ValueError(f"unknown verification parameter: {name}")
+
+    if max_delta < threshold:
+        raise ValueError("max-delta must be greater than or equal to threshold")
+    return VerificationCheck(
+        tool=tool,
+        test=test,
+        slack=slack,
+        dpi=dpi,
+        threshold=threshold,
+        max_delta=max_delta,
+    )
+
+
+def parse_bounded_int(name: str, value: str, *, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"invalid {name} value: {value}") from exc
+    if not minimum <= parsed <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return parsed
 
 
 def parse_bool_param(name: str, value: str) -> bool:
@@ -474,7 +563,11 @@ def _optimize_pdf(
     failures: dict[str, str] = {}
     plan_results: list[PlanResult] = []
     attempted = 0
-    verification_runner = VerificationRunner(source, verification_checks)
+    verification_runner = VerificationRunner(
+        source,
+        verification_checks,
+        cache_dir=temp_dir / "verification-cache",
+    )
 
     for plan_index, plan in enumerate(plans, start=1):
         attempted += 1
@@ -550,10 +643,18 @@ def page_count(path: Path) -> int:
 
 
 class VerificationRunner:
-    def __init__(self, source: Path, checks: tuple[VerificationCheck, ...]) -> None:
+    def __init__(
+        self,
+        source: Path,
+        checks: tuple[VerificationCheck, ...],
+        *,
+        cache_dir: Path,
+    ) -> None:
         self.source = source
         self.checks = checks
+        self.cache_dir = cache_dir
         self._pdf2text_cache: dict[Path, str] = {}
+        self._source_render_cache: dict[int, tuple[Path, ...]] = {}
 
     def run(self, candidate: Path) -> tuple[VerificationResult, ...]:
         return tuple(self._run_check(check, candidate) for check in self.checks)
@@ -561,6 +662,8 @@ class VerificationRunner:
     def _run_check(self, check: VerificationCheck, candidate: Path) -> VerificationResult:
         if check.tool is VerificationTool.PDF2TEXT and check.test is VerificationTest.CHARCOUNT:
             return self._run_charcount_check(check, candidate)
+        if check.tool is VerificationTool.RENDER and check.test is VerificationTest.PIXELDIFF:
+            return self._run_pixeldiff_check(check, candidate)
         return VerificationResult(
             check=check,
             ok=False,
@@ -603,12 +706,169 @@ class VerificationRunner:
             self._pdf2text_cache[resolved] = text
         return text
 
+    def _run_pixeldiff_check(
+        self,
+        check: VerificationCheck,
+        candidate: Path,
+    ) -> VerificationResult:
+        try:
+            source_pages = self._source_render_pages(check.dpi)
+            return compare_rendered_pdf(check, source_pages, candidate)
+        except Exception as exc:  # noqa: BLE001 - report this as a failed verification.
+            return VerificationResult(check=check, ok=False, error=str(exc))
+
+    def _source_render_pages(self, dpi: int) -> tuple[Path, ...]:
+        paths = self._source_render_cache.get(dpi)
+        if paths is None:
+            paths = render_pdf_pages(
+                self.source,
+                self.cache_dir / f"source-{dpi}dpi",
+                dpi=dpi,
+            )
+            self._source_render_cache[dpi] = paths
+        return paths
+
 
 def extract_pdf2text(path: Path) -> str:
     with pymupdf.open(path) as document:
         if document.needs_pass:
             raise RuntimeError("encrypted PDF requires a password")
         return "".join(page.get_text() for page in document)
+
+
+def render_pdf_pages(path: Path, output_dir: Path, *, dpi: int) -> tuple[Path, ...]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rendered: list[Path] = []
+    with pymupdf.open(path) as document:
+        if document.needs_pass:
+            raise RuntimeError("encrypted PDF requires a password")
+        for page_number, page in enumerate(document, start=1):
+            pixmap = page.get_pixmap(
+                dpi=dpi,
+                colorspace=pymupdf.csRGB,
+                alpha=False,
+                annots=True,
+            )
+            output = output_dir / f"page-{page_number:06d}.png"
+            pixmap.save(output)
+            rendered.append(output)
+    return tuple(rendered)
+
+
+def compare_rendered_pdf(
+    check: VerificationCheck,
+    source_pages: tuple[Path, ...],
+    candidate: Path,
+) -> VerificationResult:
+    total_pixels = 0
+    changed_pixels = 0
+    max_channel_delta = 0
+    different_pages: list[int] = []
+
+    with pymupdf.open(candidate) as document:
+        if document.needs_pass:
+            raise RuntimeError("encrypted PDF requires a password")
+        if document.page_count != len(source_pages):
+            return VerificationResult(
+                check=check,
+                ok=False,
+                error=(
+                    "render page count changed "
+                    f"from {len(source_pages)} to {document.page_count}"
+                ),
+            )
+
+        for page_number, (source_path, page) in enumerate(
+            zip(source_pages, document, strict=True),
+            start=1,
+        ):
+            source_pixmap = pymupdf.Pixmap(str(source_path))
+            candidate_pixmap = page.get_pixmap(
+                dpi=check.dpi,
+                colorspace=pymupdf.csRGB,
+                alpha=False,
+                annots=True,
+            )
+            source_shape = (source_pixmap.width, source_pixmap.height, source_pixmap.n)
+            candidate_shape = (
+                candidate_pixmap.width,
+                candidate_pixmap.height,
+                candidate_pixmap.n,
+            )
+            if source_shape != candidate_shape:
+                return VerificationResult(
+                    check=check,
+                    ok=False,
+                    pages_compared=page_number,
+                    different_pages=(page_number,),
+                    error=(
+                        f"page {page_number} render dimensions changed "
+                        f"from {source_shape[0]}x{source_shape[1]} "
+                        f"to {candidate_shape[0]}x{candidate_shape[1]}"
+                    ),
+                )
+
+            page_changed, page_max_delta = pixel_diff_metrics(
+                source_pixmap.samples,
+                candidate_pixmap.samples,
+                threshold=check.threshold,
+            )
+            page_pixels = source_pixmap.width * source_pixmap.height
+            total_pixels += page_pixels
+            changed_pixels += page_changed
+            max_channel_delta = max(max_channel_delta, page_max_delta)
+            if page_changed:
+                different_pages.append(page_number)
+
+    changed_ratio = changed_pixels / total_pixels if total_pixels else 0.0
+    errors = []
+    if changed_ratio > check.slack:
+        errors.append(
+            f"changed pixel ratio {changed_ratio:g} exceeds slack {check.slack:g} "
+            f"({changed_pixels}/{total_pixels} pixels)"
+        )
+    if max_channel_delta > check.max_delta:
+        errors.append(
+            f"maximum channel delta {max_channel_delta} exceeds max-delta {check.max_delta}"
+        )
+    return VerificationResult(
+        check=check,
+        ok=not errors,
+        pages_compared=len(source_pages),
+        different_pages=tuple(different_pages),
+        total_pixels=total_pixels,
+        changed_pixels=changed_pixels,
+        changed_ratio=changed_ratio,
+        max_channel_delta=max_channel_delta,
+        error="; ".join(errors) or None,
+    )
+
+
+def pixel_diff_metrics(
+    source_samples: bytes,
+    candidate_samples: bytes,
+    *,
+    threshold: int,
+) -> tuple[int, int]:
+    if len(source_samples) != len(candidate_samples):
+        raise ValueError("render sample lengths differ")
+    if len(source_samples) % 3:
+        raise ValueError("RGB render sample length is not divisible by 3")
+    if source_samples == candidate_samples:
+        return 0, 0
+
+    changed_pixels = 0
+    max_channel_delta = 0
+    for offset in range(0, len(source_samples), 3):
+        delta = max(
+            abs(source_samples[offset] - candidate_samples[offset]),
+            abs(source_samples[offset + 1] - candidate_samples[offset + 1]),
+            abs(source_samples[offset + 2] - candidate_samples[offset + 2]),
+        )
+        max_channel_delta = max(max_channel_delta, delta)
+        if delta > threshold:
+            changed_pixels += 1
+    return changed_pixels, max_channel_delta
 
 
 def charcount(text: str, *, strip_ws: bool) -> int:

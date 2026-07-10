@@ -6,6 +6,7 @@ import subprocess
 import warnings
 
 import pikepdf
+import pymupdf
 import pytest
 
 from pdfcom.cli import (
@@ -17,6 +18,8 @@ from pdfcom.cli import (
     output_collision_errors,
     process_records,
     run,
+    verification_check_stats_record,
+    verification_stats_record,
 )
 from pdfcom.optimizer import (
     Candidate,
@@ -33,6 +36,7 @@ from pdfcom.optimizer import (
     expand_plan_spec,
     optimization_plans,
     parse_verification_spec,
+    pixel_diff_metrics,
     plan_label,
     run_pikepdf,
     run_qpdf,
@@ -420,6 +424,170 @@ def test_verification_spec_minigrammar_examples() -> None:
             strip_ws=True,
         ),
     )
+
+
+def test_render_verification_spec_defaults_and_overrides() -> None:
+    assert parse_verification_spec("render") == (
+        VerificationCheck(
+            VerificationTool.RENDER,
+            VerificationTest.PIXELDIFF,
+            slack=0.001,
+            dpi=144,
+            threshold=16,
+            max_delta=96,
+        ),
+    )
+    assert parse_verification_spec(
+        "render:pixeldiff:dpi=200:threshold=0:slack=0:max-delta=0"
+    ) == (
+        VerificationCheck(
+            VerificationTool.RENDER,
+            VerificationTest.PIXELDIFF,
+            slack=0.0,
+            dpi=200,
+            threshold=0,
+            max_delta=0,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    (
+        ("render:pixeldiff:dpi=0", "dpi must be between 1 and 1200"),
+        ("render:pixeldiff:threshold=256", "threshold must be between 0 and 255"),
+        ("render:pixeldiff:slack=1.1", "render slack must be between 0 and 1"),
+        ("render:pixeldiff:max-delta=-1", "max-delta must be between 0 and 255"),
+        (
+            "render:pixeldiff:threshold=32:max-delta=16",
+            "max-delta must be greater than or equal to threshold",
+        ),
+    ),
+)
+def test_render_verification_spec_rejects_invalid_parameters(spec: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        parse_verification_spec(spec)
+
+
+def test_pixel_diff_metrics_apply_channel_threshold() -> None:
+    source = bytes((0, 0, 0, 100, 100, 100))
+    candidate = bytes((16, 0, 0, 120, 100, 100))
+
+    assert pixel_diff_metrics(source, candidate, threshold=16) == (1, 20)
+
+
+def test_render_verification_disqualifies_visual_change(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.pdf"
+    changed = tmp_path / "changed.pdf"
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=300)
+        for line in range(20):
+            page.insert_text((20, 30 + line * 12), f"Visible source line {line}", fontsize=10)
+        document.save(source)
+    with pymupdf.open() as document:
+        document.new_page(width=300, height=300)
+        document.save(changed)
+    assert changed.stat().st_size < source.stat().st_size
+
+    def write_changed_output(method: Method, input_path: Path, output: Path) -> None:
+        output.write_bytes(changed.read_bytes())
+
+    monkeypatch.setattr("pdfcom.optimizer.run_method", write_changed_output)
+    check = parse_verification_spec("render")[0]
+
+    result = _optimize_pdf(
+        source,
+        tmp_path,
+        plans=((Method.QPDF,),),
+        verification_checks=(check,),
+    )
+
+    assert result.best == Candidate((), source.resolve(), source.stat().st_size)
+    plan_result = result.plan_results[0]
+    assert plan_result.ok is False
+    assert plan_result.error is not None
+    assert plan_result.error.startswith("verification failed: render:pixeldiff:")
+    render_result = plan_result.verification_results[0]
+    assert render_result.ok is False
+    assert render_result.pages_compared == 1
+    assert render_result.different_pages == (1,)
+    assert render_result.changed_pixels is not None and render_result.changed_pixels > 0
+    assert render_result.changed_ratio is not None and render_result.changed_ratio > check.slack
+    assert render_result.max_channel_delta == 255
+
+
+def test_render_verification_accepts_identical_render(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.pdf"
+    with pymupdf.open() as document:
+        page = document.new_page(width=300, height=300)
+        page.insert_text((20, 30), "Visually unchanged", fontsize=12)
+        document.save(source)
+
+    def copy_source(method: Method, input_path: Path, output: Path) -> None:
+        output.write_bytes(input_path.read_bytes())
+
+    monkeypatch.setattr("pdfcom.optimizer.run_method", copy_source)
+    check = parse_verification_spec("render")[0]
+
+    result = _optimize_pdf(
+        source,
+        tmp_path,
+        plans=((Method.QPDF,),),
+        verification_checks=(check,),
+    )
+
+    render_result = result.plan_results[0].verification_results[0]
+    assert result.plan_results[0].ok is True
+    assert render_result.ok is True
+    assert render_result.different_pages == ()
+    assert render_result.changed_pixels == 0
+    assert render_result.changed_ratio == 0.0
+    assert render_result.max_channel_delta == 0
+
+
+def test_render_verification_stats_include_pixel_metrics() -> None:
+    check = parse_verification_spec("render")[0]
+    result = VerificationResult(
+        check,
+        ok=True,
+        pages_compared=2,
+        different_pages=(2,),
+        total_pixels=1000,
+        changed_pixels=1,
+        changed_ratio=0.001,
+        max_channel_delta=40,
+    )
+
+    assert verification_check_stats_record(check) == {
+        "tool": "render",
+        "test": "pixeldiff",
+        "dpi": 144,
+        "threshold": 16,
+        "slack": 0.001,
+        "max_delta": 96,
+    }
+    assert verification_stats_record(result) == {
+        "tool": "render",
+        "test": "pixeldiff",
+        "dpi": 144,
+        "threshold": 16,
+        "slack": 0.001,
+        "max_delta": 96,
+        "ok": True,
+        "error": None,
+        "pages_compared": 2,
+        "different_pages": [2],
+        "total_pixels": 1000,
+        "changed_pixels": 1,
+        "changed_ratio": 0.001,
+        "max_channel_delta": 40,
+    }
 
 
 def test_verification_charcount_failure_disqualifies_candidate(

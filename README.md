@@ -150,7 +150,41 @@ count. `slack=0.02` allows a 2% difference. `strip-ws` removes whitespace before
 counting. If a candidate fails verification, that plan is disqualified and
 `pdfcom` continues trying the remaining plans.
 
+Use `render:pixeldiff` (or the shorter `render`) to compare source and candidate
+page renders in RGB using PyMuPDF:
+
+```bash
+pdfcom -t render -o compressed foo.pdf
+```
+
+The default render check is equivalent to:
+
+```text
+render:pixeldiff:dpi=144:threshold=16:slack=0.001:max-delta=96
+```
+
+`dpi` controls render resolution. A pixel is changed when any RGB channel
+differs by more than `threshold`, and `slack` is the allowed fraction of changed
+pixels across the document. `max-delta` is a hard limit on any single channel
+difference, which catches small but high-contrast changes that could fit within
+the aggregate slack. Render dimensions must match exactly. Values for `dpi`
+must be between 1 and 1200; `threshold` and `max-delta` must be between 0 and
+255; and `slack` must be between 0 and 1.
+
+Useful parameterizations include:
+
+```text
+render                                                        # balanced defaults
+render:pixeldiff:threshold=0:slack=0:max-delta=0              # exact pixels
+render:pixeldiff:dpi=200:threshold=24:slack=0.002:max-delta=128 # more tolerant
+pdf2text:charcount:slack=0.01:strip-ws,render                  # text and render
+```
+
+The source is rendered once per DPI and cached as lossless PNG pages in the
+optimization temporary directory. Candidate pages are rendered and compared
+one at a time, so the check does not retain full-document RGB buffers in memory.
+
 Use `-s` to write a JSON stats file with one result per input PDF. Each result
 includes the winning plan, unavailable methods, failed plans, verification
-results, and per-plan sizes so method order and marginal savings can be analyzed
-after a run.
+results (including render pixel metrics), and per-plan sizes so method order and
+marginal savings can be analyzed after a run.
