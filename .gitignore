@@ -5,7 +5,13 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
 
 # Virtual environments
 .venv
-/scratch/
+
+# macOS metadata
+.DS_Store
